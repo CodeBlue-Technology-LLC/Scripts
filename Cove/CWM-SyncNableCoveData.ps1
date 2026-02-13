@@ -67,13 +67,18 @@
 
 
     ## Connectwise API connection information (loaded from Config\Credentials.txt lines 4-8)
-    $CWMcredlines = Get-Content (Join-Path $PSScriptRoot "Config\Credentials.txt")
-    $CWMAPICreds = @{
-        Server      = $CWMcredlines[3]
-        Company     = $CWMcredlines[4]
-        pubKey      = $CWMcredlines[5]
-        privateKey  = $CWMcredlines[6]
-        clientId    = $CWMcredlines[7]
+    $Script:CWMCredFile = Join-Path $PSScriptRoot "Config\Credentials.txt"
+    if (Test-Path $Script:CWMCredFile) {
+        $CWMcredlines = Get-Content $Script:CWMCredFile
+        if ($CWMcredlines.Count -ge 8) {
+            $CWMAPICreds = @{
+                Server      = $CWMcredlines[3]
+                Company     = $CWMcredlines[4]
+                pubKey      = $CWMcredlines[5]
+                privateKey  = $CWMcredlines[6]
+                clientId    = $CWMcredlines[7]
+            }
+        }
     }
 
     Clear-Host
@@ -124,11 +129,38 @@
         $PartnerName | out-file $APIcredfile
 
         $BackupCred = Get-Credential -Message 'Enter Login Email and Password for Backup.Management API'
-        $BackupCred | Add-Member -MemberType NoteProperty -Name PartnerName -Value "$PartnerName" 
+        $BackupCred | Add-Member -MemberType NoteProperty -Name PartnerName -Value "$PartnerName"
 
         $BackupCred.UserName | Out-file -append $APIcredfile
         $BackupCred.Password | ConvertFrom-SecureString | Out-file -append $APIcredfile
-        
+
+        ## Prompt for ConnectWise Manage API credentials if not already in file
+        $existingLines = Get-Content $APIcredfile
+        if ($existingLines.Count -lt 8) {
+            Write-Output $Script:strLineSeparator
+            Write-Output "  Setting ConnectWise Manage API Credentials"
+            $CWMServer     = Read-Host "  Enter CWM Server URL (e.g. connect.example.com)"
+            $CWMCompany    = Read-Host "  Enter CWM Company ID (e.g. mycompany)"
+            $CWMPubKey     = Read-Host "  Enter CWM Public Key"
+            $CWMPrivateKey = Read-Host "  Enter CWM Private Key"
+            $CWMClientId   = Read-Host "  Enter CWM Client ID"
+
+            $CWMServer     | Out-File -Append $APIcredfile
+            $CWMCompany    | Out-File -Append $APIcredfile
+            $CWMPubKey     | Out-File -Append $APIcredfile
+            $CWMPrivateKey | Out-File -Append $APIcredfile
+            $CWMClientId   | Out-File -Append $APIcredfile
+
+            ## Load CWM creds into memory
+            $Script:CWMAPICreds = @{
+                Server     = $CWMServer
+                Company    = $CWMCompany
+                pubKey     = $CWMPubKey
+                privateKey = $CWMPrivateKey
+                clientId   = $CWMClientId
+            }
+        }
+
         Start-Sleep -milliseconds 300
 
         Send-APICredentialsCookie  ## Attempt API Authentication
@@ -162,11 +194,36 @@
                     $Script:cred2 = $APIcredentials[2] | Convertto-SecureString 
                     $Script:cred2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($Script:cred2))
 
-                    Write-Output    $Script:strLineSeparator 
+                    Write-Output    $Script:strLineSeparator
                     Write-Output "  Stored Backup API Partner  = $Script:cred0"
                     Write-Output "  Stored Backup API User     = $Script:cred1"
                     Write-Output "  Stored Backup API Password = Encrypted"
-                    
+
+                    ## Check if CWM credentials are also present (lines 4-8)
+                    if ($APIcredentials.Count -lt 8) {
+                        Write-Output $Script:strLineSeparator
+                        Write-Output "  ConnectWise Manage API Credentials Not Found - Setting Up"
+                        $CWMServer     = Read-Host "  Enter CWM Server URL (e.g. connect.example.com)"
+                        $CWMCompany    = Read-Host "  Enter CWM Company ID (e.g. mycompany)"
+                        $CWMPubKey     = Read-Host "  Enter CWM Public Key"
+                        $CWMPrivateKey = Read-Host "  Enter CWM Private Key"
+                        $CWMClientId   = Read-Host "  Enter CWM Client ID"
+
+                        $CWMServer     | Out-File -Append $APIcredfile
+                        $CWMCompany    | Out-File -Append $APIcredfile
+                        $CWMPubKey     | Out-File -Append $APIcredfile
+                        $CWMPrivateKey | Out-File -Append $APIcredfile
+                        $CWMClientId   | Out-File -Append $APIcredfile
+
+                        $Script:CWMAPICreds = @{
+                            Server     = $CWMServer
+                            Company    = $CWMCompany
+                            pubKey     = $CWMPubKey
+                            privateKey = $CWMPrivateKey
+                            clientId   = $CWMClientId
+                        }
+                    }
+
                 }else{
                     Write-Output    $Script:strLineSeparator 
                     Write-Output "  Backup API Credential File Not Present"
