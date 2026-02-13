@@ -66,18 +66,12 @@
     }  ## Cove to PSA Product Mapping
 
 
-    ## Connectwise API connection information (loaded from Config\Credentials.txt lines 4-8)
-    $Script:CWMCredFile = Join-Path $PSScriptRoot "Config\Credentials.txt"
-    if (Test-Path $Script:CWMCredFile) {
-        $CWMcredlines = Get-Content $Script:CWMCredFile
-        if ($CWMcredlines.Count -ge 8) {
-            $CWMAPICreds = @{
-                Server      = $CWMcredlines[3]
-                Company     = $CWMcredlines[4]
-                pubKey      = $CWMcredlines[5]
-                privateKey  = $CWMcredlines[6]
-                clientId    = $CWMcredlines[7]
-            }
+    ## Load credentials from Config\Credentials.xml (DPAPI-encrypted, user/machine-specific)
+    $Script:ConfigPath = Join-Path $PSScriptRoot "Config\Credentials.xml"
+    if (Test-Path $Script:ConfigPath) {
+        $Script:Config = Import-Clixml -Path $Script:ConfigPath
+        if ($Script:Config.CWMConnectionInfo) {
+            $CWMAPICreds = $Script:Config.CWMConnectionInfo
         }
     }
 
@@ -122,44 +116,37 @@
         Write-Output "  Setting Backup API Credentials"
         if (Test-Path $APIcredpath) {
             Write-Output $Script:strLineSeparator
-            Write-Output "  Backup API Credential Path Present" 
+            Write-Output "  Backup API Credential Path Present"
         }
-        else{New-Item -ItemType Directory -Path $APIcredpath} 
-        
-        $PartnerName | out-file $APIcredfile
+        else{New-Item -ItemType Directory -Path $APIcredpath}
 
         $BackupCred = Get-Credential -Message 'Enter Login Email and Password for Backup.Management API'
-        $BackupCred | Add-Member -MemberType NoteProperty -Name PartnerName -Value "$PartnerName"
 
-        $BackupCred.UserName | Out-file -append $APIcredfile
-        $BackupCred.Password | ConvertFrom-SecureString | Out-file -append $APIcredfile
+        Write-Output $Script:strLineSeparator
+        Write-Output "  Setting ConnectWise Manage API Credentials"
+        $CWMServer     = Read-Host "  Enter CWM Server URL (e.g. connect.example.com)"
+        $CWMCompany    = Read-Host "  Enter CWM Company ID (e.g. mycompany)"
+        $CWMPubKey     = Read-Host "  Enter CWM Public Key"
+        $CWMPrivateKey = Read-Host "  Enter CWM Private Key"
+        $CWMClientId   = Read-Host "  Enter CWM Client ID"
 
-        ## Prompt for ConnectWise Manage API credentials if not already in file
-        $existingLines = Get-Content $APIcredfile
-        if ($existingLines.Count -lt 8) {
-            Write-Output $Script:strLineSeparator
-            Write-Output "  Setting ConnectWise Manage API Credentials"
-            $CWMServer     = Read-Host "  Enter CWM Server URL (e.g. connect.example.com)"
-            $CWMCompany    = Read-Host "  Enter CWM Company ID (e.g. mycompany)"
-            $CWMPubKey     = Read-Host "  Enter CWM Public Key"
-            $CWMPrivateKey = Read-Host "  Enter CWM Private Key"
-            $CWMClientId   = Read-Host "  Enter CWM Client ID"
-
-            $CWMServer     | Out-File -Append $APIcredfile
-            $CWMCompany    | Out-File -Append $APIcredfile
-            $CWMPubKey     | Out-File -Append $APIcredfile
-            $CWMPrivateKey | Out-File -Append $APIcredfile
-            $CWMClientId   | Out-File -Append $APIcredfile
-
-            ## Load CWM creds into memory
-            $Script:CWMAPICreds = @{
+        @{
+            CovePartnerName  = $PartnerName
+            CoveCredential   = $BackupCred
+            CWMConnectionInfo = @{
                 Server     = $CWMServer
                 Company    = $CWMCompany
                 pubKey     = $CWMPubKey
                 privateKey = $CWMPrivateKey
                 clientId   = $CWMClientId
             }
-        }
+        } | Export-Clixml -Path $APIcredfile
+
+        Write-Output "  Configuration saved to $APIcredfile"
+
+        ## Load into memory
+        $Script:Config = Import-Clixml -Path $APIcredfile
+        $Script:CWMAPICreds = $Script:Config.CWMConnectionInfo
 
         Start-Sleep -milliseconds 300
 
@@ -169,68 +156,46 @@
 
     Function Get-APICredentials {
 
-        $Script:True_path = $PSScriptRoot
-        $Script:APIcredfile = join-path -Path $True_Path -ChildPath "Config\Credentials.txt"
-        $Script:APIcredpath = Split-path -path $APIcredfile
+        $Script:APIcredfile = Join-Path $PSScriptRoot "Config\Credentials.xml"
+        $Script:APIcredpath = Split-Path -Path $APIcredfile
 
-        if (($ClearCredentials) -and (Test-Path $APIcredfile)) { 
+        if (($ClearCredentials) -and (Test-Path $APIcredfile)) {
             Remove-Item -Path $Script:APIcredfile
             $ClearCredentials = $Null
-            Write-Output $Script:strLineSeparator 
-            Write-Output "  Backup API Credential File Cleared"
+            Write-Output $Script:strLineSeparator
+            Write-Output "  Credential File Cleared"
             Send-APICredentialsCookie  ## Retry Authentication
-            
-            }else{ 
-                Write-Output $Script:strLineSeparator 
-                Write-Output "  Getting Backup API Credentials" 
-            
-                if (Test-Path $APIcredfile) {
-                    Write-Output    $Script:strLineSeparator        
-                    "  Backup API Credential File Present"
-                    $APIcredentials = get-content $APIcredfile
-                    
-                    $Script:cred0 = [string]$APIcredentials[0] 
-                    $Script:cred1 = [string]$APIcredentials[1]
-                    $Script:cred2 = $APIcredentials[2] | Convertto-SecureString 
-                    $Script:cred2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($Script:cred2))
 
-                    Write-Output    $Script:strLineSeparator
-                    Write-Output "  Stored Backup API Partner  = $Script:cred0"
-                    Write-Output "  Stored Backup API User     = $Script:cred1"
-                    Write-Output "  Stored Backup API Password = Encrypted"
+        }else{
+            Write-Output $Script:strLineSeparator
+            Write-Output "  Getting Backup API Credentials"
 
-                    ## Check if CWM credentials are also present (lines 4-8)
-                    if ($APIcredentials.Count -lt 8) {
-                        Write-Output $Script:strLineSeparator
-                        Write-Output "  ConnectWise Manage API Credentials Not Found - Setting Up"
-                        $CWMServer     = Read-Host "  Enter CWM Server URL (e.g. connect.example.com)"
-                        $CWMCompany    = Read-Host "  Enter CWM Company ID (e.g. mycompany)"
-                        $CWMPubKey     = Read-Host "  Enter CWM Public Key"
-                        $CWMPrivateKey = Read-Host "  Enter CWM Private Key"
-                        $CWMClientId   = Read-Host "  Enter CWM Client ID"
+            if (Test-Path $APIcredfile) {
+                Write-Output    $Script:strLineSeparator
+                Write-Output "  Credential File Present"
+                $Script:Config = Import-Clixml -Path $APIcredfile
 
-                        $CWMServer     | Out-File -Append $APIcredfile
-                        $CWMCompany    | Out-File -Append $APIcredfile
-                        $CWMPubKey     | Out-File -Append $APIcredfile
-                        $CWMPrivateKey | Out-File -Append $APIcredfile
-                        $CWMClientId   | Out-File -Append $APIcredfile
+                $Script:cred0 = $Script:Config.CovePartnerName
+                $Script:cred1 = $Script:Config.CoveCredential.UserName
+                $Script:cred2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Script:Config.CoveCredential.Password))
 
-                        $Script:CWMAPICreds = @{
-                            Server     = $CWMServer
-                            Company    = $CWMCompany
-                            pubKey     = $CWMPubKey
-                            privateKey = $CWMPrivateKey
-                            clientId   = $CWMClientId
-                        }
-                    }
+                Write-Output    $Script:strLineSeparator
+                Write-Output "  Stored Backup API Partner  = $Script:cred0"
+                Write-Output "  Stored Backup API User     = $Script:cred1"
+                Write-Output "  Stored Backup API Password = Encrypted"
 
-                }else{
-                    Write-Output    $Script:strLineSeparator 
-                    Write-Output "  Backup API Credential File Not Present"
-
-                    Set-APICredentials  ## Create API Credential File if Not Found
-                    }
+                if ($Script:Config.CWMConnectionInfo) {
+                    $Script:CWMAPICreds = $Script:Config.CWMConnectionInfo
                 }
+
+            }else{
+                Write-Output    $Script:strLineSeparator
+                Write-Output "  Credential File Not Present"
+
+                Set-APICredentials  ## Create Credential File if Not Found
+            }
+        }
 
     } ## Get API credentials if present
 
