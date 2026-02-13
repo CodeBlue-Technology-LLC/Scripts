@@ -110,17 +110,40 @@
 #region ----- Functions ----
 
 #region ----- Authentication ----
-    Function Set-APICredentials {
+    Function Set-CoveCredentials {
 
         Write-Output $Script:strLineSeparator
-        Write-Output "  Setting Backup API Credentials"
+        Write-Output "  Setting Cove API Credentials"
         if (Test-Path $APIcredpath) {
             Write-Output $Script:strLineSeparator
             Write-Output "  Backup API Credential Path Present"
         }
-        else{New-Item -ItemType Directory -Path $APIcredpath}
+        else { New-Item -ItemType Directory -Path $APIcredpath | Out-Null }
 
         $BackupCred = Get-Credential -Message 'Enter Login Email and Password for Backup.Management API'
+        if (-not $BackupCred) {
+            Write-Warning "  Cove credential entry was cancelled."
+            return $false
+        }
+
+        ## Load existing config to preserve CWM credentials
+        $Config = @{}
+        if (Test-Path $APIcredfile) {
+            $Config = Import-Clixml -Path $APIcredfile
+        }
+        $Config.CovePartnerName = $PartnerName
+        $Config.CoveCredential  = $BackupCred
+        $Config | Export-Clixml -Path $APIcredfile
+
+        Write-Output "  Cove credentials saved to $APIcredfile"
+
+        ## Load into memory
+        $Script:Config = Import-Clixml -Path $APIcredfile
+        return $true
+
+    } ## Set Cove API credentials only
+
+    Function Set-CWMCredentials {
 
         Write-Output $Script:strLineSeparator
         Write-Output "  Setting ConnectWise Manage API Credentials"
@@ -130,114 +153,153 @@
         $CWMPrivateKey = Read-Host "  Enter CWM Private Key"
         $CWMClientId   = Read-Host "  Enter CWM Client ID"
 
-        @{
-            CovePartnerName  = $PartnerName
-            CoveCredential   = $BackupCred
-            CWMConnectionInfo = @{
-                Server     = $CWMServer
-                Company    = $CWMCompany
-                pubKey     = $CWMPubKey
-                privateKey = $CWMPrivateKey
-                clientId   = $CWMClientId
-            }
-        } | Export-Clixml -Path $APIcredfile
+        if (-not $CWMServer -or -not $CWMCompany -or -not $CWMPubKey -or -not $CWMPrivateKey -or -not $CWMClientId) {
+            Write-Warning "  CWM credential entry was incomplete."
+            return $false
+        }
 
-        Write-Output "  Configuration saved to $APIcredfile"
+        ## Load existing config to preserve Cove credentials
+        $Config = @{}
+        if (Test-Path $APIcredfile) {
+            $Config = Import-Clixml -Path $APIcredfile
+        }
+        $Config.CWMConnectionInfo = @{
+            Server     = $CWMServer
+            Company    = $CWMCompany
+            pubKey     = $CWMPubKey
+            privateKey = $CWMPrivateKey
+            clientId   = $CWMClientId
+        }
+        $Config | Export-Clixml -Path $APIcredfile
+
+        Write-Output "  CWM credentials saved to $APIcredfile"
 
         ## Load into memory
         $Script:Config = Import-Clixml -Path $APIcredfile
         $Script:CWMAPICreds = $Script:Config.CWMConnectionInfo
+        return $true
 
-        Start-Sleep -milliseconds 300
+    } ## Set CWM API credentials only
 
-        Send-APICredentialsCookie  ## Attempt API Authentication
-
-    } ## Set API credentials if not present
-
-    Function Get-APICredentials {
+    Function Send-APICredentialsCookie {
 
         $Script:APIcredfile = Join-Path $PSScriptRoot "Config\Credentials.xml"
         $Script:APIcredpath = Split-Path -Path $APIcredfile
 
+        ## Handle -ClearCredentials switch
         if (($ClearCredentials) -and (Test-Path $APIcredfile)) {
             Remove-Item -Path $Script:APIcredfile
             $ClearCredentials = $Null
             Write-Output $Script:strLineSeparator
             Write-Output "  Credential File Cleared"
-            Send-APICredentialsCookie  ## Retry Authentication
+        }
 
-        }else{
-            Write-Output $Script:strLineSeparator
-            Write-Output "  Getting Backup API Credentials"
+        $MaxRetries = 3
+        $Attempt = 0
 
+        while ($Attempt -lt $MaxRetries) {
+            $Attempt++
+
+            ## Load or prompt for Cove credentials
             if (Test-Path $APIcredfile) {
-                Write-Output    $Script:strLineSeparator
+                Write-Output $Script:strLineSeparator
                 Write-Output "  Credential File Present"
                 $Script:Config = Import-Clixml -Path $APIcredfile
 
                 $Script:cred0 = $Script:Config.CovePartnerName
                 $Script:cred1 = $Script:Config.CoveCredential.UserName
-                $Script:cred2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Script:Config.CoveCredential.Password))
-
-                Write-Output    $Script:strLineSeparator
-                Write-Output "  Stored Backup API Partner  = $Script:cred0"
-                Write-Output "  Stored Backup API User     = $Script:cred1"
-                Write-Output "  Stored Backup API Password = Encrypted"
+                $Script:cred2 = if ($Script:Config.CoveCredential.Password) {
+                    [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Script:Config.CoveCredential.Password))
+                } else { $null }
 
                 if ($Script:Config.CWMConnectionInfo) {
                     $Script:CWMAPICreds = $Script:Config.CWMConnectionInfo
                 }
+            }
 
-            }else{
-                Write-Output    $Script:strLineSeparator
-                Write-Output "  Credential File Not Present"
+            ## If Cove credentials are missing, prompt for them (not CWM)
+            if (-not $Script:cred0 -or -not $Script:cred1 -or -not $Script:cred2) {
+                Write-Output $Script:strLineSeparator
+                Write-Output "  Cove credentials not found - please enter them"
+                if (-not (Set-CoveCredentials)) {
+                    Write-Warning "  Credential entry cancelled. Attempt $Attempt of $MaxRetries."
+                    continue
+                }
+                ## Reload after saving
+                $Script:Config = Import-Clixml -Path $APIcredfile
+                $Script:cred0 = $Script:Config.CovePartnerName
+                $Script:cred1 = $Script:Config.CoveCredential.UserName
+                $Script:cred2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Script:Config.CoveCredential.Password))
+            }
 
-                Set-APICredentials  ## Create Credential File if Not Found
+            Write-Output $Script:strLineSeparator
+            Write-Output "  Stored Backup API Partner  = $Script:cred0"
+            Write-Output "  Stored Backup API User     = $Script:cred1"
+            Write-Output "  Stored Backup API Password = Encrypted"
+
+            ## Attempt Cove API authentication
+            $url = "https://api.backup.management/jsonapi"
+            $data = @{}
+            $data.jsonrpc = '2.0'
+            $data.id = '2'
+            $data.method = 'Login'
+            $data.params = @{}
+            $data.params.partner = $Script:cred0
+            $data.params.username = $Script:cred1
+            $data.params.password = $Script:cred2
+
+            try {
+                $webrequest = Invoke-WebRequest -Method POST `
+                    -ContentType 'application/json' `
+                    -Body (ConvertTo-Json $data) `
+                    -Uri $url `
+                    -TimeoutSec 30 `
+                    -SessionVariable Script:websession `
+                    -UseBasicParsing
+                $Script:cookies = $websession.Cookies.GetCookies($url)
+                $Script:websession = $websession
+                $Script:Authenticate = $webrequest | ConvertFrom-Json
+            }
+            catch {
+                Write-Output $Script:strLineSeparator
+                Write-Warning "  Connection to Cove API failed: $($_.Exception.Message)"
+                Write-Output "  Attempt $Attempt of $MaxRetries"
+                Write-Output $Script:strLineSeparator
+                if ($Attempt -lt $MaxRetries) {
+                    Write-Output "  Please re-enter your Cove credentials"
+                    Set-CoveCredentials | Out-Null
+                    ## Clear cached creds so they reload next iteration
+                    $Script:cred0 = $null; $Script:cred1 = $null; $Script:cred2 = $null
+                }
+                continue
+            }
+
+            if ($Script:Authenticate.visa) {
+                $Script:visa = $Script:Authenticate.visa
+                $Script:UserId = $Script:Authenticate.result.result.id
+                return  ## Authentication successful
+            }
+
+            ## Login failed - bad credentials
+            Write-Output $Script:strLineSeparator
+            Write-Warning "  Cove Authentication Failed: $($Script:Authenticate.error.message)"
+            Write-Output "  Please Note: Multiple failed authentication attempts could temporarily lockout your user account"
+            Write-Output "  Attempt $Attempt of $MaxRetries"
+            Write-Output $Script:strLineSeparator
+
+            if ($Attempt -lt $MaxRetries) {
+                Write-Output "  Please re-enter your Cove credentials"
+                Set-CoveCredentials | Out-Null
+                ## Clear cached creds so they reload next iteration
+                $Script:cred0 = $null; $Script:cred1 = $null; $Script:cred2 = $null
             }
         }
 
-    } ## Get API credentials if present
-
-    Function Send-APICredentialsCookie {
-
-    Get-APICredentials  ## Read API Credential File before Authentication
-
-    $url = "https://api.backup.management/jsonapi"
-    $data = @{}
-    $data.jsonrpc = '2.0'
-    $data.id = '2'
-    $data.method = 'Login'
-    $data.params = @{}
-    $data.params.partner = $Script:cred0
-    $data.params.username = $Script:cred1
-    $data.params.password = $Script:cred2
-
-    $webrequest = Invoke-WebRequest -Method POST `
-        -ContentType 'application/json' `
-        -Body (ConvertTo-Json $data) `
-        -Uri $url `
-        -TimeoutSec 30 `
-        -SessionVariable Script:websession `
-        -UseBasicParsing
-        $Script:cookies = $websession.Cookies.GetCookies($url)
-        $Script:websession = $websession
-        $Script:Authenticate = $webrequest | convertfrom-json
-
-    #Debug Write-Output "$($Script:cookies[0].name) = $($cookies[0].value)"
-
-    if ($authenticate.visa) { 
-
-        $Script:visa = $authenticate.visa
-        $Script:UserId = $authenticate.result.result.id
-        }else{
-            Write-Output    $Script:strLineSeparator 
-            Write-Output "  Authentication Failed: Please confirm your Backup.Management Partner Name and Credentials"
-            Write-Output "  Please Note: Multiple failed authentication attempts could temporarily lockout your user account"
-            Write-Output    $Script:strLineSeparator 
-            
-            Set-APICredentials  ## Create API Credential File if Authentication Fails
-        }
+        Write-Output $Script:strLineSeparator
+        Write-Error "  Cove API authentication failed after $MaxRetries attempts. Exiting."
+        Exit 1
 
     } ## Use Backup.Management credentials to Authenticate
 
@@ -922,12 +984,45 @@
         } ## Install | Update ConnectWise Manage API PS Module
 
         Function AuthenticateCWM {
-            if ( ($CWMAPICreds.pubKey -eq '') -or ($CWMAPICreds.privateKey -eq '') -or ($CWMAPICreds.Company -eq '') -or ($CWMAPICreds.clientId -eq '') -or ($CWMAPICreds.Server -eq '') ) {
-                Write-Warning " ConnectWise Manage Api Credentials not found in script. `nExiting."
-                Break
-            }else{
-                Connect-CWM @CWMAPICreds
+            $MaxRetries = 3
+            $Attempt = 0
+
+            while ($Attempt -lt $MaxRetries) {
+                $Attempt++
+
+                ## Check if CWM credentials are present
+                if ( -not $CWMAPICreds -or ($CWMAPICreds.pubKey -eq '') -or ($CWMAPICreds.privateKey -eq '') -or ($CWMAPICreds.Company -eq '') -or ($CWMAPICreds.clientId -eq '') -or ($CWMAPICreds.Server -eq '') ) {
+                    Write-Warning "  ConnectWise Manage API credentials not found or incomplete."
+                    Write-Output "  Attempt $Attempt of $MaxRetries"
+                    if ($Attempt -le $MaxRetries) {
+                        if (-not (Set-CWMCredentials)) {
+                            Write-Warning "  CWM credential entry cancelled or incomplete."
+                            continue
+                        }
+                    }
+                }
+
+                try {
+                    Connect-CWM @CWMAPICreds
+                    Write-Output "  ConnectWise Manage Authentication Successful"
+                    return  ## Success
+                }
+                catch {
+                    Write-Output $Script:strLineSeparator
+                    Write-Warning "  CWM Authentication Failed: $($_.Exception.Message)"
+                    Write-Output "  Attempt $Attempt of $MaxRetries"
+                    Write-Output $Script:strLineSeparator
+
+                    if ($Attempt -lt $MaxRetries) {
+                        Write-Output "  Please re-enter your CWM credentials"
+                        Set-CWMCredentials | Out-Null
+                    }
+                }
             }
+
+            Write-Output $Script:strLineSeparator
+            Write-Error "  CWM authentication failed after $MaxRetries attempts. Exiting."
+            Break
         } ## Connect to ConnectWise Manage instance
 
         Function GreenText  {  
