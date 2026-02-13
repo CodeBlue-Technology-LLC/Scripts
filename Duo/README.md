@@ -6,7 +6,7 @@ PowerShell scripts for managing Duo Security subaccounts as an MSP.
 
 ### ProvisionDuoAccount.ps1
 
-Provisions new Duo subaccounts for ConnectWise Manage companies. The script searches ConnectWise for the company, creates a Duo subaccount with the matching name, and applies standard settings (timezone, universal prompt, helpdesk enrollment email).
+Provisions new Duo subaccounts for ConnectWise Manage companies. The script searches ConnectWise for the company, creates a Duo subaccount with the matching name, and applies standard settings (timezone, universal prompt).
 
 ```powershell
 # Interactive - prompts for company name
