@@ -1,6 +1,6 @@
 # Duo MSP Scripts
 
-PowerShell scripts for managing Duo Security subaccounts as an MSP, built by Code Blue Technology.
+PowerShell scripts for managing Duo Security subaccounts as an MSP.
 
 ## Scripts
 
