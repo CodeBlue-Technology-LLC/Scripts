@@ -1,3 +1,5 @@
 # Sensitive configuration files (credentials, API keys)
 Config/
 .claude/
+/*.csv
+/*.xlsx
