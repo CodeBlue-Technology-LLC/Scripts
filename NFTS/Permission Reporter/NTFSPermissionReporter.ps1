@@ -75,7 +75,7 @@ $script:errorCount = 0
 $script:startTime = Get-Date
 
 # Simple flat structure - we'll build the tree in JavaScript
-$allFolders = [System.Collections.ArrayList]::new()
+$allFolders = New-Object System.Collections.ArrayList
 
 function Get-FolderPermissions {
     param(
