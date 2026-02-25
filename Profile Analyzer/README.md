@@ -27,7 +27,6 @@ This script **recursively checks ALL files** in each user folder to find the tru
 
 **Two versions available:**
 1. **Analyze-StaleProfiles-NoModule.ps1** ✅ **RECOMMENDED** - Uses .NET DirectoryServices, no module required
-2. **Analyze-StaleProfiles.ps1** - Requires ActiveDirectory PowerShell module (RSAT)
 
 ## Installation
 1. Save the script to your desired location
