@@ -5,8 +5,8 @@ This PowerShell script helps identify and analyze stale user profile folders (li
 
 ## The Problem It Solves
 VMware Horizon (and similar profile management systems) create user folders on file servers. Sometimes the parent folder's "Date Modified" doesn't reflect recent activity inside subdirectories. For example:
-- `C:\Shares\Users\cgauldin\` shows last modified 2018
-- But `C:\Shares\Users\cgauldin\Documents\report.docx` was modified yesterday
+- `C:\Shares\Users\chris\` shows last modified 2018
+- But `C:\Shares\Users\chris\Documents\report.docx` was modified yesterday
 
 This script **recursively checks ALL files** in each user folder to find the true last activity date.
 
