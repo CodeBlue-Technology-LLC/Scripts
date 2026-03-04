@@ -188,21 +188,90 @@ foreach ($currentUser in $users) {
     # Discover SharePoint sites the user has access to
     Write-Host "`nChecking SharePoint sites for $currentUser..." -ForegroundColor Cyan
 
-    foreach ($tenantSite in $allTenantSites) {
+    # 1) Get user ID and all transitive group memberships (M365 groups + security groups)
+    Write-Host "  Checking group memberships..." -ForegroundColor Gray
+    $userId = $null
+    $userGroupIds = @{}
+    try {
+        $userId = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$currentUser`?`$select=id").id
+
+        # transitiveMemberOf resolves nested groups — catches security groups inside other groups
+        $transitiveUri = "https://graph.microsoft.com/v1.0/users/$userId/transitiveMemberOf?`$select=id,displayName,groupTypes&`$top=999"
+        do {
+            $transitiveResponse = Invoke-MgGraphRequest -Method GET -Uri $transitiveUri
+            foreach ($grp in $transitiveResponse.value) {
+                if ($grp.'@odata.type' -eq '#microsoft.graph.group') {
+                    $userGroupIds[$grp.id] = $grp.displayName
+                }
+            }
+            $transitiveUri = $transitiveResponse.'@odata.nextLink'
+        } while ($transitiveUri)
+        Write-Host "  Found $($userGroupIds.Count) group memberships" -ForegroundColor Gray
+    } catch {
+        Write-Host "  Warning: Could not retrieve group memberships: $_" -ForegroundColor Yellow
+    }
+
+    # 2) M365 group-connected sites: directly look up SharePoint sites for Unified groups
+    $groupSiteUrls = @{}
+    foreach ($gid in $userGroupIds.Keys) {
         try {
-            $spoUser = Get-SPOUser -Site $tenantSite.Url -LoginName $currentUser -ErrorAction SilentlyContinue
-            if ($spoUser) {
-                $siteName = $tenantSite.Url.Split('/')[-1]
+            $groupSite = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$gid/sites/root?`$select=id,displayName,webUrl" -ErrorAction Stop
+            if ($groupSite.webUrl -and -not $groupSiteUrls.ContainsKey($groupSite.webUrl)) {
+                $groupSiteUrls[$groupSite.webUrl] = $true
                 $siteObj = [PSCustomObject]@{
-                    displayName = if ($tenantSite.Title) { $tenantSite.Title } else { $siteName }
-                    webUrl = $tenantSite.Url
-                    id = $null
+                    displayName = if ($groupSite.displayName) { $groupSite.displayName } else { $userGroupIds[$gid] }
+                    webUrl = $groupSite.webUrl
+                    id = $groupSite.id
                 }
                 $allUserSites += $siteObj
-                Write-Host "  $($siteObj.displayName)" -ForegroundColor DarkGray
+                Write-Host "  $($siteObj.displayName) (via M365 group)" -ForegroundColor DarkGray
             }
         } catch {
-            # User doesn't have access, skip
+            # Not a Unified group or no site — expected for security groups
+        }
+    }
+
+    # 3) Direct + security group access: check each tenant site
+    Write-Host "  Checking site permissions (direct + security group)..." -ForegroundColor Gray
+    $knownUrls = @{}
+    foreach ($s in $allUserSites) { $knownUrls[$s.webUrl] = $true }
+
+    foreach ($tenantSite in $allTenantSites) {
+        if ($knownUrls.ContainsKey($tenantSite.Url)) { continue }
+        $found = $false
+
+        # Fast path: check if user is directly listed
+        try {
+            $spoUser = Get-SPOUser -Site $tenantSite.Url -LoginName $currentUser -ErrorAction SilentlyContinue
+            if ($spoUser) { $found = $true }
+        } catch { }
+
+        # Slow path: check if any of the user's security groups are listed as site users
+        if (-not $found -and $userGroupIds.Count -gt 0) {
+            try {
+                $siteUsers = Get-SPOUser -Site $tenantSite.Url -ErrorAction SilentlyContinue
+                foreach ($siteUser in $siteUsers) {
+                    # SharePoint stores Azure AD groups as claims containing the group GUID
+                    foreach ($gid in $userGroupIds.Keys) {
+                        if ($siteUser.LoginName -match [regex]::Escape($gid)) {
+                            $found = $true
+                            break
+                        }
+                    }
+                    if ($found) { break }
+                }
+            } catch { }
+        }
+
+        if ($found) {
+            $siteName = $tenantSite.Url.Split('/')[-1]
+            $siteObj = [PSCustomObject]@{
+                displayName = if ($tenantSite.Title) { $tenantSite.Title } else { $siteName }
+                webUrl = $tenantSite.Url
+                id = $null
+            }
+            $allUserSites += $siteObj
+            Write-Host "  $($siteObj.displayName) (direct/security group)" -ForegroundColor DarkGray
         }
     }
 
