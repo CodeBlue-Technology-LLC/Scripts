@@ -294,6 +294,13 @@ foreach ($currentUser in $users) {
         Write-Host "Site: $($spoSite.displayName)" -ForegroundColor Yellow
         Write-Host "URL: $($spoSite.webUrl)" -ForegroundColor Gray
 
+        # Compute the shortcut name up front so we can show it before prompting
+        $shortcutName = $spoSite.displayName
+        if ($shortcutName -match '^(.+?) - \1$') {
+            $shortcutName = $Matches[1]
+        }
+        Write-Host "Will map as: $shortcutName" -ForegroundColor White
+
         if (-not $AutoMap) {
             $mapSite = Read-Host "Map this site to OneDrive? (Y/n)"
             if ($mapSite -eq "N" -or $mapSite -eq "n") {
@@ -327,23 +334,49 @@ foreach ($currentUser in $users) {
                 $folderItem = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/drives/$($drive.id)/root"
             }
 
-            $shortcutName = if ($folderItem.name -eq "root") { $spoSite.displayName } else { $folderItem.name }
-
-            # Check if shortcut already exists in user's OneDrive
-            $existingItem = $null
+            # Check if shortcut already exists with the correct name (direct path lookup)
+            $existingCorrect = $null
             try {
-                $encodedName = [Uri]::EscapeDataString($shortcutName)
-                $existingItem = Invoke-MgGraphRequest -Method GET `
-                    -Uri "https://graph.microsoft.com/v1.0/users/$currentUser/drive/root:/${encodedName}" `
+                $encodedCorrect = [Uri]::EscapeDataString($shortcutName)
+                $existingCorrect = Invoke-MgGraphRequest -Method GET `
+                    -Uri "https://graph.microsoft.com/v1.0/users/$currentUser/drive/root:/$encodedCorrect" `
                     -ErrorAction Stop
-            } catch {
-                # 404 means it doesn't exist, which is expected
-            }
-            if ($existingItem) {
-                Write-Host "Already mapped - '$shortcutName' already exists in OneDrive. Skipping." -ForegroundColor Yellow
+            } catch { }
+            if ($existingCorrect) {
+                Write-Host "Already mapped - '$shortcutName' exists in OneDrive. Skipping." -ForegroundColor Yellow
                 continue
             }
 
+            # Check for existing shortcuts with old bad names and rename them
+            $possibleOldNames = @(
+                $spoSite.displayName                          # raw display name (e.g. "3 Amigos - 3 Amigos")
+                "$shortcutName - $shortcutName"               # duplicated form if displayName was already clean
+                "General"                                     # old script used folder name for Teams sites
+            ) | Select-Object -Unique | Where-Object { $_ -ne $shortcutName }
+
+            $renamed = $false
+            foreach ($oldName in $possibleOldNames) {
+                try {
+                    $encodedOld = [Uri]::EscapeDataString($oldName)
+                    $oldItem = Invoke-MgGraphRequest -Method GET `
+                        -Uri "https://graph.microsoft.com/v1.0/users/$currentUser/drive/root:/$encodedOld" `
+                        -ErrorAction Stop
+                    if ($oldItem) {
+                        Write-Host "Renaming '$oldName' -> '$shortcutName'..." -ForegroundColor Yellow
+                        Invoke-MgGraphRequest -Method PATCH `
+                            -Uri "https://graph.microsoft.com/v1.0/users/$currentUser/drive/items/$($oldItem.id)" `
+                            -Body (@{ name = $shortcutName } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+                        Write-Host "Successfully renamed to '$shortcutName'!" -ForegroundColor Green
+                        $renamed = $true
+                        break
+                    }
+                } catch {
+                    # 404 = doesn't exist, expected
+                }
+            }
+            if ($renamed) { continue }
+
+            # No existing shortcut found — create new one
             $body = @{
                 name       = $shortcutName
                 remoteItem = @{
@@ -353,11 +386,17 @@ foreach ($currentUser in $users) {
                     }
                 }
             }
-            Invoke-MgGraphRequest -Method POST `
+            $newItem = Invoke-MgGraphRequest -Method POST `
                 -Uri "https://graph.microsoft.com/v1.0/users/$currentUser/drive/root/children" `
                 -Body ($body | ConvertTo-Json -Depth 10) -ContentType "application/json"
 
-            Write-Host "Successfully mapped $($spoSite.displayName)!" -ForegroundColor Green
+            # Graph ignores the name field on shortcut creation — rename if needed
+            if ($newItem.name -ne $shortcutName) {
+                Invoke-MgGraphRequest -Method PATCH `
+                    -Uri "https://graph.microsoft.com/v1.0/users/$currentUser/drive/items/$($newItem.id)" `
+                    -Body (@{ name = $shortcutName } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+            }
+            Write-Host "Successfully mapped as '$shortcutName'!" -ForegroundColor Green
         }
         catch {
             $errMsg = $_.ToString()
