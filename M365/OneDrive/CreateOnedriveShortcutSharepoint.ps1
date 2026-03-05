@@ -302,9 +302,35 @@ foreach ($currentUser in $users) {
         Write-Host "Will map as: $shortcutName" -ForegroundColor White
 
         if (-not $AutoMap) {
-            $mapSite = Read-Host "Map this site to OneDrive? (Y/n)"
-            if ($mapSite -eq "N" -or $mapSite -eq "n") {
+            $mapSite = Read-Host "Map (Y) / Remove (N) / Skip (S)?"
+            if ($mapSite -eq "S" -or $mapSite -eq "s") {
                 Write-Host "Skipping $($spoSite.displayName)..." -ForegroundColor Gray
+                continue
+            }
+            if ($mapSite -eq "N" -or $mapSite -eq "n") {
+                # Remove existing shortcut from OneDrive
+                $removed = $false
+                $namesToCheck = @($shortcutName, $spoSite.displayName, "General") | Select-Object -Unique
+                foreach ($nameToRemove in $namesToCheck) {
+                    try {
+                        $encodedName = [Uri]::EscapeDataString($nameToRemove)
+                        $existingItem = Invoke-MgGraphRequest -Method GET `
+                            -Uri "https://graph.microsoft.com/v1.0/users/$currentUser/drive/root:/$encodedName" `
+                            -ErrorAction Stop
+                        if ($existingItem) {
+                            Invoke-MgGraphRequest -Method DELETE `
+                                -Uri "https://graph.microsoft.com/v1.0/users/$currentUser/drive/items/$($existingItem.id)" | Out-Null
+                            Write-Host "Removed shortcut '$nameToRemove' from OneDrive." -ForegroundColor Green
+                            $removed = $true
+                            break
+                        }
+                    } catch {
+                        # 404 = doesn't exist, try next name
+                    }
+                }
+                if (-not $removed) {
+                    Write-Host "No existing shortcut found to remove for $($spoSite.displayName)." -ForegroundColor Yellow
+                }
                 continue
             }
         }
