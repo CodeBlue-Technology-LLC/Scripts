@@ -2,16 +2,12 @@
 # Exchange Online - Message ID Lookup from CSV
 # Requires: ExchangeOnlineManagement module
 # Install:  Install-Module -Name ExchangeOnlineManagement
+# Script is rate limited for large csv's
 # ============================================================
 #
 # Usage
 #	.\365BulkMessageTrackByMessage_ID.ps1 -InputCsv "C:\temp\SmtpCSReport_Custom Report - SmtpCSReport - 3262026_8644ff59-c6e5-4886-8c81-0481d2206665.csv" -OutputCsv "C:\temp\results.csv"
-# ============================================================
-# Exchange Online - Message ID Lookup from CSV
-# Uses Get-MessageTraceV2 with rate limit handling
-# Throttle limit: 100 requests per 5 minute window
-# Requires: ExchangeOnlineManagement module v3.x+
-# ============================================================
+#
 
 param(
     [Parameter(Mandatory)]
