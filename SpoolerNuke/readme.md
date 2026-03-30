@@ -1,6 +1,6 @@
 # SpoolerNuke.ps1
 
-Nukes and rebuilds the Windows Print Spooler environment on a print server or RDS host. Removes all third-party drivers, print processors, port monitors, and driver files, then restarts the spooler clean. Printers re-map automatically via Group Policy after cleanup.
+Nukes and rebuilds the Windows Print Spooler environment on a print server or RDS host. Removes all third-party drivers, print processors, port monitors, and driver files, then restarts the spooler clean. Printers re-map automatically via Group Policy after cleanup, if configured.
 
 ---
 
