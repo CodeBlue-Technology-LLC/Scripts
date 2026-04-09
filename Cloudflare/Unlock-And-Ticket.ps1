@@ -95,7 +95,7 @@ Connect-CWM @ConnectWiseCreds
 # Search for company using Cloudflare subaccount name
 $companyName = $cfAccountName
 Write-Host "  Searching for company: $companyName" -ForegroundColor Cyan
-$companies = Get-CWMCompany -condition "name like '%$companyName%'"
+$companies = @(Get-CWMCompany -condition "name like '*$companyName*'" -all)
 
 $normalizedSearch = $companyName -replace '[^\w\s]', '' -replace '\s+', ' '
 $matchingCompany = $companies | Where-Object {

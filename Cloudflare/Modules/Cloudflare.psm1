@@ -452,6 +452,7 @@ function Import-CloudflareDNS {
             content  = if ($record.type -eq 'TXT' -and $record.data -notmatch '^\s*".*"\s*$') { "`"$($record.data)`"" } else { $record.data }
             ttl      = if ($record.ttl -lt 60) { 1 } else { $record.ttl }
             priority = $record.priority
+            proxied  = [bool]$record.proxied
         }
     }
 
@@ -513,6 +514,10 @@ function Import-CloudflareDNS {
 
                     if ($null -ne $record.priority -and $record.type -in @("MX")) {
                         $params.Priority = $record.priority
+                    }
+
+                    if ($record.type -in @("A", "AAAA", "CNAME")) {
+                        $params.Proxied = [bool]$record.proxied
                     }
 
                     $result = New-CloudflareDNSRecord @params
