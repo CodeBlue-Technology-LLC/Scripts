@@ -344,6 +344,29 @@ $CloudflareCreds = $Credentials.Cloudflare
 $ConnectWiseCreds = $Credentials.ConnectWise
 $ITGlueCreds = $Credentials.ITGlue
 
+function Get-AllCloudflareAccounts {
+    <#
+    .SYNOPSIS
+        Retrieves all Cloudflare accounts with pagination (default API page size is 20).
+    #>
+    $headers = @{
+        "X-Auth-Email" = $CloudflareCreds.Email
+        "X-Auth-Key"   = $CloudflareCreds.ApiKey
+        "Content-Type" = "application/json"
+    }
+    $allAccounts = @()
+    $page = 1
+    do {
+        $response = Invoke-RestMethod -Uri "https://api.cloudflare.com/client/v4/accounts?page=$page&per_page=50" `
+            -Headers $headers -Method Get
+        if ($response.success -and $response.result) {
+            $allAccounts += $response.result
+        }
+        $page++
+    } while ($response.result -and $response.result.Count -eq 50)
+    return $allAccounts
+}
+
 function Write-Banner {
     param([string]$Text)
     Write-Host ""
@@ -377,7 +400,7 @@ switch ($PSCmdlet.ParameterSetName) {
 
     'ListCFAccounts' {
         Write-Banner "Cloudflare Accounts"
-        $accounts = Get-CloudflareAccounts -Credentials $CloudflareCreds
+        $accounts = Get-AllCloudflareAccounts
         $accounts | Format-Table id, name, type -AutoSize
         exit 0
     }
@@ -536,19 +559,29 @@ Write-Banner "Step 2: Cloudflare Account Setup"
 
 if ($AccountId) {
     Write-Host "Using existing account: $AccountId" -ForegroundColor Yellow
-    # Fetch account details to get the name
-    $cfAccounts = Get-CloudflareAccounts -Credentials $CloudflareCreds
-    $cfAccount = $cfAccounts | Where-Object { $_.id -eq $AccountId }
-    if (-not $cfAccount) {
-        Write-Error "Account not found: $AccountId"
-        exit 1
+    # Fetch the specific account directly (avoids pagination issues)
+    $cfAccount = @{ id = $AccountId; name = $AccountId }
+    try {
+        $headers = @{
+            "X-Auth-Email" = $CloudflareCreds.Email
+            "X-Auth-Key"   = $CloudflareCreds.ApiKey
+            "Content-Type" = "application/json"
+        }
+        $acctResponse = Invoke-RestMethod -Uri "https://api.cloudflare.com/client/v4/accounts/$AccountId" `
+            -Headers $headers -Method Get
+        if ($acctResponse.success) {
+            $cfAccount = $acctResponse.result
+            Write-Host "Account name: $($cfAccount.name)" -ForegroundColor Cyan
+        }
     }
-    Write-Host "Account name: $($cfAccount.name)" -ForegroundColor Cyan
+    catch {
+        Write-Warning "Could not fetch account details, but will proceed with ID: $AccountId"
+    }
 }
 else {
     # Check if an account with this name already exists
     Write-Host "Checking for existing Cloudflare account '$CustomerName'..." -ForegroundColor Yellow
-    $existingAccounts = Get-CloudflareAccounts -Credentials $CloudflareCreds
+    $existingAccounts = Get-AllCloudflareAccounts
     $normalizedCustomer = $CustomerName -replace '[^\w\s]', '' -replace '\s+', ' '
     $matchingAccounts = $existingAccounts | Where-Object {
         $normalizedName = $_.name -replace '[^\w\s]', '' -replace '\s+', ' '
@@ -881,7 +914,7 @@ if ($unlockChoice -eq 0) {
                     # Search for company using Cloudflare subaccount name
                     $companyName = $cfAccount.name
                     Write-Host "  Searching ConnectWise for company: $companyName" -ForegroundColor Cyan
-                    $companies = Get-CWMCompany -condition "name like '%$companyName%'"
+                    $companies = @(Get-CWMCompany -condition "name like '*$companyName*'" -all)
 
                     # Find matching company using normalized name comparison
                     $normalizedSearch = $companyName -replace '[^\w\s]', '' -replace '\s+', ' '
