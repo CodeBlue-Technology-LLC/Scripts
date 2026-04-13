@@ -89,7 +89,7 @@ if (-not (Test-Path $StagingPath)) {
 
 # Download nk2edit if not present
 if (-not (Test-Path $Nk2EditPath)) {
-    Write-Host "nk2edit.exe not found — downloading from NirSoft..."
+    Write-Host "nk2edit.exe not found - downloading from NirSoft..."
     $nk2ZipUrl  = "https://www.nirsoft.net/utils/nk2edit-32-64.zip"
     $nk2ZipFile = Join-Path $StagingPath "nk2edit.zip"
     try {
@@ -311,14 +311,14 @@ function Import-AutocompleteCache {
     }
     Write-Host "  Using: $($backupCache.Name) ($([math]::Round($backupCache.Length / 1KB, 1)) KB)"
 
-    # Determine registry base path — HKCU for user context, HKU\<SID> for SYSTEM
+    # Determine registry base path - HKCU for user context, HKU\<SID> for SYSTEM
     $isSystem = Test-RunningAsSystem
     $hiveLoaded = $false
     $regBase = "HKCU:"
     $userSID = $null
 
     if ($isSystem) {
-        Write-Host "  Running as SYSTEM — resolving user registry hive..."
+        Write-Host "  Running as SYSTEM - resolving user registry hive..."
 
         $userSID = Get-UserSID -Username $TargetUser
         if (-not $userSID) {
@@ -364,7 +364,7 @@ function Import-AutocompleteCache {
         # Allow Office 365 autodiscover endpoint
         Set-RegistryValue -Path "$outlookBase\AutoDiscover" -Name "ExcludeExplicitO365Endpoint" -Value 0
 
-        # Re-apply signature defaults — Outlook resets these per-account when a new profile is
+        # Re-apply signature defaults - Outlook resets these per-account when a new profile is
         # created, so we read the existing values and write them back after profile setup to
         # ensure they stick as global fallback defaults.
         $mailSettingsPath = "$regBase\Software\Microsoft\Office\16.0\Common\MailSettings"
@@ -383,7 +383,7 @@ function Import-AutocompleteCache {
                 Write-Host "    Reply/forward: $replySig"
             }
         } else {
-            Write-Host "  No signature defaults found in MailSettings — skipping."
+            Write-Host "  No signature defaults found in MailSettings - skipping."
         }
 
         Write-Host "  Registry configured."
@@ -400,7 +400,7 @@ function Import-AutocompleteCache {
         $nk2FinalFile = Join-Path $nk2FinalDir "$ProfileName.nk2"
 
         if (Test-Path $nk2FinalFile) {
-            Write-Host "  NK2 already exists at '$nk2FinalFile' — skipping conversion."
+            Write-Host "  NK2 already exists at '$nk2FinalFile' - skipping conversion."
         } else {
             if (-not (Test-Path $nk2FinalDir)) {
                 New-Item -Path $nk2FinalDir -ItemType Directory -Force | Out-Null
@@ -423,7 +423,7 @@ function Import-AutocompleteCache {
 
         # Launch Outlook or schedule import for next login
         if ($isSystem) {
-            Write-Host "  Running as SYSTEM — scheduling NK2 import for next user login..."
+            Write-Host "  Running as SYSTEM - scheduling NK2 import for next user login..."
 
             $outlookExe = Get-OutlookExePath
             if ($outlookExe) {
