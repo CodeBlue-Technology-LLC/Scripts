@@ -38,9 +38,6 @@
 .PARAMETER ProfileName
     Name for the new Outlook profile. Default: "Office 365"
 
-.PARAMETER OutlookWaitSeconds
-    Seconds to wait for Outlook to initialize before closing it. Default: 30
-
 .EXAMPLE
     # Full migration as SYSTEM (e.g., via RMM tool)
     .\Migrate-AutocompleteCache.ps1 -Mode Full
@@ -70,9 +67,7 @@ param(
 
     [string]$Nk2EditPath,
 
-    [string]$ProfileName = "Office 365",
-
-    [int]$OutlookWaitSeconds = 30
+    [string]$ProfileName = "Office 365"
 )
 
 $ErrorActionPreference = "Stop"
@@ -437,22 +432,14 @@ function Import-AutocompleteCache {
             }
         } else {
             $outlookExe = Get-OutlookExePath
-            if (-not $outlookExe) {
-                Write-Warning "Could not find Outlook. Run it manually with: outlook.exe /importnk2 /profile `"$ProfileName`""
-                return
-            }
-
-            Write-Host "  Launching Outlook to import NK2 (waiting $OutlookWaitSeconds seconds)..."
-            $proc = Start-Process -FilePath $outlookExe `
-                -ArgumentList "/importnk2", "/profile `"$ProfileName`"" -PassThru
-
-            Start-Sleep -Seconds $OutlookWaitSeconds
-
-            if (-not $proc.HasExited) {
-                $proc.Kill()
-                Write-Host "  Outlook closed after NK2 import."
+            if ($outlookExe) {
+                $runOnceKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+                $importCmd = "`"$outlookExe`" /importnk2 /profile `"$ProfileName`""
+                Set-RegistryValue -Path $runOnceKey -Name "OutlookNK2Import" -Value $importCmd -Type String
+                Write-Host "  RunOnce entry created. Outlook will import the NK2 on next login."
             } else {
-                Write-Host "  Outlook exited on its own."
+                Write-Warning "Could not find Outlook executable. The user will need to run Outlook manually with:"
+                Write-Warning "  outlook.exe /importnk2 /profile `"$ProfileName`""
             }
         }
 
