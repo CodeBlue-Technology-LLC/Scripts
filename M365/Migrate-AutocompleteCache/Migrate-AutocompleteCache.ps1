@@ -408,14 +408,14 @@ function Import-AutocompleteCache {
 
             Write-Host "  Converting stream_autocomplete -> text..."
             & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextFile
-            if ($LASTEXITCODE -ne 0) {
-                throw "nk2edit /nk2_to_text failed (exit code $LASTEXITCODE)."
+            if (-not (Test-Path $nk2TextFile)) {
+                throw "nk2edit /nk2_to_text failed - output file not created. nk2edit may not support running as SYSTEM."
             }
 
             Write-Host "  Converting text -> NK2 binary..."
             & $Nk2EditPath /text_to_nk2 $nk2TextFile $nk2FinalFile
-            if ($LASTEXITCODE -ne 0) {
-                throw "nk2edit /text_to_nk2 failed (exit code $LASTEXITCODE)."
+            if (-not (Test-Path $nk2FinalFile)) {
+                throw "nk2edit /text_to_nk2 failed - output file not created."
             }
 
             Write-Host "  NK2 staged: $nk2FinalFile"
