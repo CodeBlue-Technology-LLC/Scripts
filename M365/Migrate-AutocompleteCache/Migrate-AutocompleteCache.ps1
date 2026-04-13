@@ -29,10 +29,10 @@
     when running as SYSTEM, or $env:USERNAME otherwise).
 
 .PARAMETER StagingPath
-    Folder to stage exported autocomplete files. Default: C:\autocomplete
+    Folder to stage exported autocomplete files. Default: C:\cbt\m365
 
 .PARAMETER Nk2EditPath
-    Path to nk2edit.exe. Default: <StagingPath>\nk2edit.exe
+    Path to nk2edit.exe. Default: <StagingPath>\nk2edit.exe (C:\cbt\m365\nk2edit.exe)
     Download from NirSoft: https://www.nirsoft.net/utils/outlook_nk2_edit.html
 
 .PARAMETER ProfileName
@@ -66,7 +66,7 @@ param(
 
     [string]$TargetUser,
 
-    [string]$StagingPath = "C:\autocomplete",
+    [string]$StagingPath = "C:\cbt\m365",
 
     [string]$Nk2EditPath,
 
@@ -79,6 +79,12 @@ $ErrorActionPreference = "Stop"
 
 if (-not $Nk2EditPath) {
     $Nk2EditPath = Join-Path $StagingPath "nk2edit.exe"
+}
+
+# Ensure staging folder exists
+if (-not (Test-Path $StagingPath)) {
+    New-Item -Path $StagingPath -ItemType Directory -Force | Out-Null
+    Write-Host "Created staging folder: $StagingPath"
 }
 
 #region Helper Functions
