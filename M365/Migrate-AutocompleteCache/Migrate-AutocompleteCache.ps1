@@ -89,7 +89,7 @@ if (-not (Test-Path $StagingPath)) {
 
 # Download nk2edit if not present
 if (-not (Test-Path $Nk2EditPath)) {
-    Write-Host "nk2edit.exe not found — downloading from NirSoft..."
+    Write-Host "nk2edit.exe not found - downloading from NirSoft..."
     $nk2ZipUrl  = "https://www.nirsoft.net/utils/nk2edit-32-64.zip"
     $nk2ZipFile = Join-Path $StagingPath "nk2edit.zip"
     try {
@@ -181,23 +181,8 @@ function Get-UserSID {
 }
 
 function Get-OutlookExePath {
-    # App Paths registry (works for both 32-bit and 64-bit installs)
-    try {
-        $appPath = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE" -ErrorAction SilentlyContinue).'(Default)'
-        if ($appPath -and (Test-Path $appPath)) { return $appPath }
-    } catch { }
-
-    # Check common install locations
-    $candidates = @(
-        "$env:ProgramFiles\Microsoft Office\root\Office16\outlook.exe"
-        "${env:ProgramFiles(x86)}\Microsoft Office\root\Office16\outlook.exe"
-        "$env:ProgramFiles\Microsoft Office\Office16\outlook.exe"
-        "${env:ProgramFiles(x86)}\Microsoft Office\Office16\outlook.exe"
-    )
-    foreach ($path in $candidates) {
-        if (Test-Path $path) { return $path }
-    }
-
+    $appPath = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE" -ErrorAction SilentlyContinue).'(Default)'
+    if ($appPath -and (Test-Path $appPath)) { return $appPath }
     return $null
 }
 
@@ -326,14 +311,14 @@ function Import-AutocompleteCache {
     }
     Write-Host "  Using: $($backupCache.Name) ($([math]::Round($backupCache.Length / 1KB, 1)) KB)"
 
-    # Determine registry base path — HKCU for user context, HKU\<SID> for SYSTEM
+    # Determine registry base path - HKCU for user context, HKU\<SID> for SYSTEM
     $isSystem = Test-RunningAsSystem
     $hiveLoaded = $false
     $regBase = "HKCU:"
     $userSID = $null
 
     if ($isSystem) {
-        Write-Host "  Running as SYSTEM — resolving user registry hive..."
+        Write-Host "  Running as SYSTEM - resolving user registry hive..."
 
         $userSID = Get-UserSID -Username $TargetUser
         if (-not $userSID) {
@@ -379,6 +364,28 @@ function Import-AutocompleteCache {
         # Allow Office 365 autodiscover endpoint
         Set-RegistryValue -Path "$outlookBase\AutoDiscover" -Name "ExcludeExplicitO365Endpoint" -Value 0
 
+        # Re-apply signature defaults - Outlook resets these per-account when a new profile is
+        # created, so we read the existing values and write them back after profile setup to
+        # ensure they stick as global fallback defaults.
+        $mailSettingsPath = "$regBase\Software\Microsoft\Office\16.0\Common\MailSettings"
+        $existingSettings = Get-ItemProperty -Path $mailSettingsPath -ErrorAction SilentlyContinue
+        $newSig   = $existingSettings.NewSignature
+        $replySig = $existingSettings.ReplySignature
+
+        if ($newSig -or $replySig) {
+            Write-Host "  Re-applying signature defaults..."
+            if ($newSig) {
+                Set-RegistryValue -Path $mailSettingsPath -Name "NewSignature" -Value $newSig -Type String
+                Write-Host "    New email  : $newSig"
+            }
+            if ($replySig) {
+                Set-RegistryValue -Path $mailSettingsPath -Name "ReplySignature" -Value $replySig -Type String
+                Write-Host "    Reply/forward: $replySig"
+            }
+        } else {
+            Write-Host "  No signature defaults found in MailSettings - skipping."
+        }
+
         Write-Host "  Registry configured."
 
         # Convert stream_autocomplete -> nk2 via nk2edit
@@ -393,7 +400,7 @@ function Import-AutocompleteCache {
         $nk2FinalFile = Join-Path $nk2FinalDir "$ProfileName.nk2"
 
         if (Test-Path $nk2FinalFile) {
-            Write-Host "  NK2 already exists at '$nk2FinalFile' — skipping conversion."
+            Write-Host "  NK2 already exists at '$nk2FinalFile' - skipping conversion."
         } else {
             if (-not (Test-Path $nk2FinalDir)) {
                 New-Item -Path $nk2FinalDir -ItemType Directory -Force | Out-Null
@@ -401,14 +408,14 @@ function Import-AutocompleteCache {
 
             Write-Host "  Converting stream_autocomplete -> text..."
             & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextFile
-            if ($LASTEXITCODE -ne 0) {
-                throw "nk2edit /nk2_to_text failed (exit code $LASTEXITCODE)."
+            if (-not (Test-Path $nk2TextFile)) {
+                throw "nk2edit /nk2_to_text failed - output file not created. nk2edit may not support running as SYSTEM."
             }
 
             Write-Host "  Converting text -> NK2 binary..."
             & $Nk2EditPath /text_to_nk2 $nk2TextFile $nk2FinalFile
-            if ($LASTEXITCODE -ne 0) {
-                throw "nk2edit /text_to_nk2 failed (exit code $LASTEXITCODE)."
+            if (-not (Test-Path $nk2FinalFile)) {
+                throw "nk2edit /text_to_nk2 failed - output file not created."
             }
 
             Write-Host "  NK2 staged: $nk2FinalFile"
@@ -416,7 +423,7 @@ function Import-AutocompleteCache {
 
         # Launch Outlook or schedule import for next login
         if ($isSystem) {
-            Write-Host "  Running as SYSTEM — scheduling NK2 import for next user login..."
+            Write-Host "  Running as SYSTEM - scheduling NK2 import for next user login..."
 
             $outlookExe = Get-OutlookExePath
             if ($outlookExe) {
