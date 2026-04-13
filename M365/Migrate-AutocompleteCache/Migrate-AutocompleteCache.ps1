@@ -379,6 +379,28 @@ function Import-AutocompleteCache {
         # Allow Office 365 autodiscover endpoint
         Set-RegistryValue -Path "$outlookBase\AutoDiscover" -Name "ExcludeExplicitO365Endpoint" -Value 0
 
+        # Re-apply signature defaults — Outlook resets these per-account when a new profile is
+        # created, so we read the existing values and write them back after profile setup to
+        # ensure they stick as global fallback defaults.
+        $mailSettingsPath = "$regBase\Software\Microsoft\Office\16.0\Common\MailSettings"
+        $existingSettings = Get-ItemProperty -Path $mailSettingsPath -ErrorAction SilentlyContinue
+        $newSig   = $existingSettings.NewSignature
+        $replySig = $existingSettings.ReplySignature
+
+        if ($newSig -or $replySig) {
+            Write-Host "  Re-applying signature defaults..."
+            if ($newSig) {
+                Set-RegistryValue -Path $mailSettingsPath -Name "NewSignature" -Value $newSig -Type String
+                Write-Host "    New email  : $newSig"
+            }
+            if ($replySig) {
+                Set-RegistryValue -Path $mailSettingsPath -Name "ReplySignature" -Value $replySig -Type String
+                Write-Host "    Reply/forward: $replySig"
+            }
+        } else {
+            Write-Host "  No signature defaults found in MailSettings — skipping."
+        }
+
         Write-Host "  Registry configured."
 
         # Convert stream_autocomplete -> nk2 via nk2edit
