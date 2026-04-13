@@ -181,23 +181,8 @@ function Get-UserSID {
 }
 
 function Get-OutlookExePath {
-    # App Paths registry (works for both 32-bit and 64-bit installs)
-    try {
-        $appPath = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE" -ErrorAction SilentlyContinue).'(Default)'
-        if ($appPath -and (Test-Path $appPath)) { return $appPath }
-    } catch { }
-
-    # Check common install locations
-    $candidates = @(
-        "$env:ProgramFiles\Microsoft Office\root\Office16\outlook.exe"
-        "${env:ProgramFiles(x86)}\Microsoft Office\root\Office16\outlook.exe"
-        "$env:ProgramFiles\Microsoft Office\Office16\outlook.exe"
-        "${env:ProgramFiles(x86)}\Microsoft Office\Office16\outlook.exe"
-    )
-    foreach ($path in $candidates) {
-        if (Test-Path $path) { return $path }
-    }
-
+    $appPath = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE" -ErrorAction SilentlyContinue).'(Default)'
+    if ($appPath -and (Test-Path $appPath)) { return $appPath }
     return $null
 }
 
