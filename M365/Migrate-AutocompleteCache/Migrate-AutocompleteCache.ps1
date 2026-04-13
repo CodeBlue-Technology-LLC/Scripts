@@ -33,7 +33,7 @@
 
 .PARAMETER Nk2EditPath
     Path to nk2edit.exe. Default: <StagingPath>\nk2edit.exe (C:\cbt\m365\nk2edit.exe)
-    Download from NirSoft: https://www.nirsoft.net/utils/outlook_nk2_edit.html
+    If not present, the script will automatically download and extract it from NirSoft.
 
 .PARAMETER ProfileName
     Name for the new Outlook profile. Default: "Office 365"
@@ -85,6 +85,24 @@ if (-not $Nk2EditPath) {
 if (-not (Test-Path $StagingPath)) {
     New-Item -Path $StagingPath -ItemType Directory -Force | Out-Null
     Write-Host "Created staging folder: $StagingPath"
+}
+
+# Download nk2edit if not present
+if (-not (Test-Path $Nk2EditPath)) {
+    Write-Host "nk2edit.exe not found — downloading from NirSoft..."
+    $nk2ZipUrl  = "https://www.nirsoft.net/utils/nk2edit-32-64.zip"
+    $nk2ZipFile = Join-Path $StagingPath "nk2edit.zip"
+    try {
+        Invoke-WebRequest -Uri $nk2ZipUrl -OutFile $nk2ZipFile -UseBasicParsing
+        Expand-Archive -Path $nk2ZipFile -DestinationPath $StagingPath -Force
+        Remove-Item $nk2ZipFile -Force
+        if (-not (Test-Path $Nk2EditPath)) {
+            throw "nk2edit.exe was not found in the archive after extraction."
+        }
+        Write-Host "  nk2edit.exe downloaded and extracted to: $Nk2EditPath"
+    } catch {
+        throw "Failed to download/extract nk2edit.exe: $_"
+    }
 }
 
 #region Helper Functions
@@ -292,10 +310,6 @@ function Export-AutocompleteCache {
 
 function Import-AutocompleteCache {
     Write-Host "=== Importing autocomplete cache for '$TargetUser' ==="
-
-    if (-not (Test-Path $Nk2EditPath)) {
-        throw "nk2edit.exe not found at '$Nk2EditPath'. Download it from NirSoft or specify -Nk2EditPath."
-    }
 
     $userStaging = Join-Path $StagingPath $TargetUser
     if (-not (Test-Path $userStaging)) {
