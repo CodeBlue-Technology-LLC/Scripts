@@ -66,11 +66,8 @@ function Get-ADInfoBySID {
         $NTAccount = $SIDObj.Translate([System.Security.Principal.NTAccount])
         $Username  = $NTAccount.Value.Split('\')[-1]
 
-        $Domain   = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
-        $DomainDN = ($Domain.Name.Split('.') | ForEach-Object { "DC=$_" }) -join ','
-
         $Searcher = New-Object System.DirectoryServices.DirectorySearcher
-        $Searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$DomainDN")
+        $Searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry
         $Searcher.Filter = "(&(objectCategory=User)(sAMAccountName=$Username))"
         $Searcher.PropertiesToLoad.Add("lastLogon")          | Out-Null
         $Searcher.PropertiesToLoad.Add("userAccountControl") | Out-Null
@@ -110,9 +107,13 @@ function Get-ADInfoBySID {
 Write-Host "Testing Active Directory connectivity..." -ForegroundColor Yellow
 $ADAvailable = $false
 try {
-    $TestDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
-    Write-Host "[OK] Connected to domain: $($TestDomain.Name)" -ForegroundColor Green
-    $ADAvailable = $true
+    $TestEntry = New-Object System.DirectoryServices.DirectoryEntry
+    if ($TestEntry.Name) {
+        Write-Host "[OK] Connected to AD: $($TestEntry.Name)" -ForegroundColor Green
+        $ADAvailable = $true
+    } else {
+        Write-Host "[WARNING] AD unavailable - SID resolution will be skipped" -ForegroundColor Yellow
+    }
 } catch {
     Write-Host "[WARNING] AD unavailable - SID resolution will be skipped" -ForegroundColor Yellow
 }
@@ -157,7 +158,7 @@ foreach ($VHD in $AllVHDX) {
         $ADInfo = @{ Exists = "N/A"; Username = "N/A"; DisplayName = "N/A"; LastLogon = "N/A"; Enabled = "N/A"; Error = $null }
     }
 
-    $DaysSince    = (New-TimeSpan -Start $VHD.LastWriteTime -End (Get-Date)).Days
+    $DaysSince     = (New-TimeSpan -Start $VHD.LastWriteTime -End (Get-Date)).Days
     $LastWriteFull = $VHD.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
 
     $Result = [PSCustomObject]@{
@@ -177,10 +178,10 @@ foreach ($VHD in $AllVHDX) {
 
     $Results += $Result
 
-    $StatusColor = if ($ADInfo.Exists -eq $false)      { "Red" }
-                   elseif ($ADInfo.Exists -eq "Error")  { "DarkYellow" }
-                   elseif ($ADInfo.Enabled -eq $false)  { "Yellow" }
-                   else                                 { "White" }
+    $StatusColor = if ($ADInfo.Exists -is [bool] -and $ADInfo.Exists -eq $false)     { "Red" }
+                   elseif ($ADInfo.Exists -is [string] -and $ADInfo.Exists -eq "Error") { "DarkYellow" }
+                   elseif ($ADInfo.Enabled -is [bool] -and $ADInfo.Enabled -eq $false)  { "Yellow" }
+                   else                                                                  { "White" }
 
     Write-Host "     User: $($ADInfo.Username) ($($ADInfo.DisplayName)) | Size: $(Format-FileSize -Bytes $VHD.Length) | AD Enabled: $($ADInfo.Enabled)" -ForegroundColor $StatusColor
 }
@@ -193,9 +194,9 @@ Write-Host "  ANALYSIS SUMMARY" -ForegroundColor Cyan
 Write-Host "===================================================================" -ForegroundColor Cyan
 
 $TotalSize     = ($Results | Measure-Object -Property SizeBytes -Sum).Sum
-$NoADUser      = @($Results | Where-Object { $_.ADUserExists -eq $false })
-$DisabledUsers = @($Results | Where-Object { $_.ADEnabled -eq $false })
-$ADErrors      = @($Results | Where-Object { $_.ADUserExists -eq "Error" })
+$NoADUser      = @($Results | Where-Object { $_.ADUserExists -is [bool] -and $_.ADUserExists -eq $false })
+$DisabledUsers = @($Results | Where-Object { $_.ADEnabled -is [bool] -and $_.ADEnabled -eq $false })
+$ADErrors      = @($Results | Where-Object { $_.ADUserExists -is [string] -and $_.ADUserExists -eq "Error" })
 $NoADSize      = ($NoADUser      | Measure-Object -Property SizeBytes -Sum).Sum
 $DisabledSize  = ($DisabledUsers | Measure-Object -Property SizeBytes -Sum).Sum
 
@@ -221,10 +222,10 @@ if ($Results.Count -gt 0) {
     $Top10 = $Results | Sort-Object SizeBytes -Descending | Select-Object -First 10
     $n = 1
     foreach ($Item in $Top10) {
-        $Tag = if ($Item.ADUserExists -eq $false)      { "[ORPHANED]" }
-               elseif ($Item.ADUserExists -eq "Error")  { "[AD ERROR]" }
-               elseif ($Item.ADEnabled -eq $false)      { "[DISABLED]" }
-               else                                     { "[ACTIVE]" }
+        $Tag = if ($Item.ADUserExists -is [bool] -and $Item.ADUserExists -eq $false)       { "[ORPHANED]" }
+               elseif ($Item.ADUserExists -is [string] -and $Item.ADUserExists -eq "Error") { "[AD ERROR]" }
+               elseif ($Item.ADEnabled -is [bool] -and $Item.ADEnabled -eq $false)          { "[DISABLED]" }
+               else                                                                          { "[ACTIVE]" }
 
         Write-Host "$n. $($Item.Username) / $($Item.DisplayName) $Tag" -ForegroundColor White
         Write-Host "   Size: $($Item.SizeFormatted) | Last Write: $($Item.LastWriteDate) | Days: $($Item.DaysSinceLastWrite)" -ForegroundColor Gray
@@ -251,7 +252,7 @@ if ($Results.Count -gt 0) {
     Write-Host "[INFO] No stale UPDs found - nothing to export" -ForegroundColor Yellow
 }
 
-$Duration = New-TimeSpan -Start $StartTime -End (Get-Date)
+$Duration    = New-TimeSpan -Start $StartTime -End (Get-Date)
 $DurationStr = $Duration.ToString('mm\:ss')
 Write-Host ""
 Write-Host "Completed in $DurationStr" -ForegroundColor Cyan
