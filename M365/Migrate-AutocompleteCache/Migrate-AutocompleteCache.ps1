@@ -331,35 +331,49 @@ function Convert-AutocompleteToNk2 {
         New-Item -Path $Nk2Destination -ItemType Directory -Force | Out-Null
     }
 
-    # nk2edit must run from its own directory
-    Push-Location (Split-Path $Nk2EditPath -Parent)
-    try {
-        Write-Host "  Converting stream_autocomplete -> text..."
-        $nk2Out1 = & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextTemp 2>&1
-        if ($nk2Out1) { Write-Host "  nk2edit output: $nk2Out1" }
-        if (-not (Test-Path $nk2TextTemp)) {
-            throw "nk2edit /nk2_to_text failed - output file not created."
-        }
-        $textSize = (Get-Item $nk2TextTemp).Length
-        Write-Host "  Text file size: $textSize bytes"
-        if ($textSize -eq 0) {
-            throw "nk2edit /nk2_to_text produced an empty file - stream_autocomplete format may not be supported."
-        }
+    # Remove leftover temp files from previous runs so we're never fooled
+    # by a stale file that happens to already exist.
+    Remove-Item $nk2TextTemp, $nk2BinTemp -Force -ErrorAction SilentlyContinue
 
-        # Show first few lines of the text file so we can verify format
-        $textPreview = Get-Content $nk2TextTemp -TotalCount 5 -ErrorAction SilentlyContinue
-        Write-Host "  Text file preview (first 5 lines):"
-        $textPreview | ForEach-Object { Write-Host "    $_" }
+    $nk2EditDir = Split-Path $Nk2EditPath -Parent
 
-        Write-Host "  Converting text -> NK2 binary..."
-        Write-Host "  Command: $Nk2EditPath /text_to_nk2 $nk2TextTemp $nk2BinTemp"
-        $nk2Out2 = & $Nk2EditPath /text_to_nk2 $nk2TextTemp $nk2BinTemp 2>&1
-        if ($nk2Out2) { Write-Host "  nk2edit output: $nk2Out2" }
-        if (-not (Test-Path $nk2BinTemp)) {
-            throw "nk2edit /text_to_nk2 failed - output file not created."
-        }
-    } finally {
-        Pop-Location
+    Write-Host "  Converting stream_autocomplete -> text..."
+    Write-Host "  Command: $Nk2EditPath /nk2_to_text `"$($backupCache.FullName)`" `"$nk2TextTemp`""
+    Start-Process -FilePath $Nk2EditPath `
+        -ArgumentList "/nk2_to_text", "`"$($backupCache.FullName)`"", "`"$nk2TextTemp`"" `
+        -WorkingDirectory $nk2EditDir -Wait
+
+    # nk2edit may return before finishing I/O - poll briefly for the file.
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((-not (Test-Path $nk2TextTemp)) -and ((Get-Date) -lt $deadline)) {
+        Start-Sleep -Milliseconds 250
+    }
+    if (-not (Test-Path $nk2TextTemp)) {
+        throw "nk2edit /nk2_to_text failed - output file not created."
+    }
+    $textSize = (Get-Item $nk2TextTemp).Length
+    Write-Host "  Text file size: $textSize bytes"
+    if ($textSize -eq 0) {
+        throw "nk2edit /nk2_to_text produced an empty file - stream_autocomplete format may not be supported."
+    }
+
+    # Show first few lines of the text file so we can verify format
+    $textPreview = Get-Content $nk2TextTemp -TotalCount 5 -ErrorAction SilentlyContinue
+    Write-Host "  Text file preview (first 5 lines):"
+    $textPreview | ForEach-Object { Write-Host "    $_" }
+
+    Write-Host "  Converting text -> NK2 binary..."
+    Write-Host "  Command: $Nk2EditPath /text_to_nk2 `"$nk2TextTemp`" `"$nk2BinTemp`""
+    Start-Process -FilePath $Nk2EditPath `
+        -ArgumentList "/text_to_nk2", "`"$nk2TextTemp`"", "`"$nk2BinTemp`"" `
+        -WorkingDirectory $nk2EditDir -Wait
+
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((-not (Test-Path $nk2BinTemp)) -and ((Get-Date) -lt $deadline)) {
+        Start-Sleep -Milliseconds 250
+    }
+    if (-not (Test-Path $nk2BinTemp)) {
+        throw "nk2edit /text_to_nk2 failed - output file not created."
     }
 
     Copy-Item $nk2BinTemp $nk2FinalFile
