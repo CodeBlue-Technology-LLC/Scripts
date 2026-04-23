@@ -7,26 +7,23 @@
     profile and imports it into a new Office 365 profile using nk2edit. Configures
     Outlook registry settings for M365 autodiscover and modern authentication.
 
-    Designed to run on individual workstations as either SYSTEM (for scripted/RMM
-    deployments) or under the target user's profile.
+    Two modes are available depending on the migration scenario:
 
-    When running as SYSTEM:
-      - Export: accesses the user's RoamCache directly (no ACL hacks needed)
-      - Import: loads the user's registry hive, stages the NK2, and creates a
-        RunOnce entry so Outlook imports it on next login.
+    System  - Run the night before as SYSTEM (e.g., via RMM). Exports the cache,
+              configures registry via the user's hive, stages the NK2, and creates
+              a RunOnce entry so Outlook imports it on next login.
 
-    When running as the user:
-      - Export: may require elevation if the user's own RoamCache has restrictive ACLs
-      - Import: writes to HKCU directly and launches Outlook to import the NK2
+    User    - Run onsite as admin in the user's session. Exports the cache, configures
+              HKCU, closes Outlook, and relaunches it with /importnk2 so the user
+              doesn't need to log off.
 
 .PARAMETER Mode
-    Export  - Backs up autocomplete cache from the user's RoamCache to a staging folder
-    Import  - Creates the Office 365 profile and imports the autocomplete cache via nk2edit
-    Full    - Runs Export then Import sequentially
+    System  - Remote/RMM deployment the night before. User logs in fresh the next day.
+    User    - Onsite migration. Outlook is closed and relaunched automatically.
 
 .PARAMETER TargetUser
-    Username to target. Defaults to the currently logged-in user (detected via explorer.exe
-    when running as SYSTEM, or $env:USERNAME otherwise).
+    Username to target. In System mode, defaults to the currently logged-in user
+    (detected via explorer.exe). In User mode, defaults to $env:USERNAME.
 
 .PARAMETER StagingPath
     Folder to stage exported autocomplete files. Default: C:\cbt\m365
@@ -39,26 +36,26 @@
     Name for the new Outlook profile. Default: "Office 365"
 
 .EXAMPLE
-    # Full migration as SYSTEM (e.g., via RMM tool)
-    .\Migrate-AutocompleteCache.ps1 -Mode Full
+    # Remote deployment as SYSTEM (e.g., via RMM tool the night before)
+    .\Migrate-AutocompleteCache.ps1 -Mode System
 
 .EXAMPLE
-    # Export only, targeting a specific user
-    .\Migrate-AutocompleteCache.ps1 -Mode Export -TargetUser jsmith
+    # Onsite migration as admin in the user's session
+    .\Migrate-AutocompleteCache.ps1 -Mode User
 
 .EXAMPLE
-    # Import only, running as the logged-in user
-    .\Migrate-AutocompleteCache.ps1 -Mode Import
+    # Onsite migration targeting a specific user
+    .\Migrate-AutocompleteCache.ps1 -Mode User -TargetUser jsmith
 
 .EXAMPLE
-    # Full migration with custom staging path and profile name
-    .\Migrate-AutocompleteCache.ps1 -Mode Full -StagingPath "D:\Migration\autocomplete" -ProfileName "Microsoft 365"
+    # Remote deployment with custom staging path and profile name
+    .\Migrate-AutocompleteCache.ps1 -Mode System -StagingPath "D:\Migration\autocomplete" -ProfileName "Microsoft 365"
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("Export", "Import", "Full")]
+    [ValidateSet("System", "User")]
     [string]$Mode,
 
     [string]$TargetUser,
@@ -113,7 +110,6 @@ function Test-IsAdmin {
 }
 
 function Get-LoggedInUser {
-    # Try explorer process first (most reliable for interactive sessions)
     try {
         $explorer = Get-Process -Name explorer -IncludeUserName -ErrorAction SilentlyContinue |
             Select-Object -First 1
@@ -122,7 +118,6 @@ function Get-LoggedInUser {
         }
     } catch { }
 
-    # Fallback to WMI
     try {
         $cs = Get-CimInstance -ClassName Win32_ComputerSystem
         if ($cs.UserName) {
@@ -136,7 +131,6 @@ function Get-LoggedInUser {
 function Get-UserProfilePath {
     param([string]$Username)
 
-    # Check ProfileList registry for exact match on leaf folder name
     $profileListPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
     foreach ($sid in (Get-ChildItem $profileListPath -ErrorAction SilentlyContinue)) {
         $profilePath = (Get-ItemProperty $sid.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
@@ -145,7 +139,6 @@ function Get-UserProfilePath {
         }
     }
 
-    # Fallback: look for folder with domain suffix (e.g., jsmith.DOMAIN)
     $match = Get-ChildItem "C:\Users" -Directory |
         Where-Object { $_.Name -eq $Username -or $_.Name -like "$Username.*" } |
         Select-Object -First 1
@@ -157,13 +150,11 @@ function Get-UserProfilePath {
 function Get-UserSID {
     param([string]$Username)
 
-    # Try translating the account name directly
     try {
         $account = New-Object System.Security.Principal.NTAccount($Username)
         return $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
     } catch { }
 
-    # Fallback: search ProfileList by profile path leaf
     $profileListPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
     foreach ($sid in (Get-ChildItem $profileListPath -ErrorAction SilentlyContinue)) {
         $profilePath = (Get-ItemProperty $sid.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
@@ -195,36 +186,17 @@ function Set-RegistryValue {
     Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type
 }
 
-#endregion
-
-#region Resolve Target User
-
-if (-not $TargetUser) {
-    if (Test-RunningAsSystem) {
-        $TargetUser = Get-LoggedInUser
-        if (-not $TargetUser) {
-            throw "Running as SYSTEM but could not detect a logged-in user. Specify -TargetUser."
-        }
-        Write-Host "Detected logged-in user: $TargetUser"
-    } else {
-        $TargetUser = $env:USERNAME
-    }
-}
-
-#endregion
-
-#region Export
-
 function Export-AutocompleteCache {
-    Write-Host "=== Exporting autocomplete cache for '$TargetUser' ==="
+    param(
+        [string]$Username,
+        [string]$Staging
+    )
 
-    if (-not (Test-IsAdmin)) {
-        throw "Export mode requires administrator privileges. Run elevated or as SYSTEM."
-    }
+    Write-Host "--- Exporting autocomplete cache ---"
 
-    $userProfile = Get-UserProfilePath -Username $TargetUser
+    $userProfile = Get-UserProfilePath -Username $Username
     if (-not $userProfile) {
-        throw "Could not find a profile folder for '$TargetUser' under C:\Users."
+        throw "Could not find a profile folder for '$Username' under C:\Users."
     }
     Write-Host "  User profile path: $userProfile"
 
@@ -255,10 +227,10 @@ function Export-AutocompleteCache {
         $streamFiles = Get-ChildItem $roamCache -Filter "stream_autocomplete*" -ErrorAction SilentlyContinue
         if (-not $streamFiles) {
             Write-Warning "No stream_autocomplete files found in RoamCache. Nothing to export."
-            return
+            return $null
         }
 
-        $destFolder = Join-Path $StagingPath $TargetUser
+        $destFolder = Join-Path $Staging $Username
         if (-not (Test-Path $destFolder)) {
             New-Item -Path $destFolder -ItemType Directory -Force | Out-Null
         }
@@ -274,6 +246,7 @@ function Export-AutocompleteCache {
         }
 
         Write-Host "  Export complete -> $destFolder"
+        return $destFolder
     } finally {
         if ($aclModified -and $accessRule) {
             Write-Host "  Removing temporary ACL..."
@@ -284,168 +257,176 @@ function Export-AutocompleteCache {
     }
 }
 
-#endregion
+function Configure-OutlookRegistry {
+    param(
+        [string]$RegBase,
+        [string]$Profile
+    )
 
-#region Import
+    $outlookBase  = "$RegBase\Software\Microsoft\Office\16.0\Outlook"
+    $identityBase = "$RegBase\Software\Microsoft\Office\16.0\Common\Identity"
 
-function Import-AutocompleteCache {
-    Write-Host "=== Importing autocomplete cache for '$TargetUser' ==="
+    Write-Host "  Configuring Outlook registry for profile '$Profile'..."
+    Set-RegistryValue -Path "$outlookBase\AutoDiscover" -Name "ZeroConfigExchange" -Value 1
+    Set-RegistryValue -Path $outlookBase -Name "DefaultProfile" -Value $Profile -Type String
 
-    $userStaging = Join-Path $StagingPath $TargetUser
-    if (-not (Test-Path $userStaging)) {
-        throw "No staged files at '$userStaging'. Run with -Mode Export first."
+    if (-not (Test-Path "$outlookBase\Profiles\$Profile")) {
+        New-Item -Path "$outlookBase\Profiles\$Profile" -Force | Out-Null
     }
 
-    # Pick the largest stream_autocomplete file (most complete cache)
-    $backupCache = Get-ChildItem $userStaging -Recurse -Filter "stream_autocomplete*" |
+    Set-RegistryValue -Path $identityBase -Name "EnableADAL" -Value 1
+    Set-RegistryValue -Path "$outlookBase\AutoDiscover" -Name "ExcludeExplicitO365Endpoint" -Value 0
+
+    # Re-apply signature defaults
+    $mailSettingsPath = "$RegBase\Software\Microsoft\Office\16.0\Common\MailSettings"
+    $existingSettings = Get-ItemProperty -Path $mailSettingsPath -ErrorAction SilentlyContinue
+    $newSig   = $existingSettings.NewSignature
+    $replySig = $existingSettings.ReplySignature
+
+    if ($newSig -or $replySig) {
+        Write-Host "  Re-applying signature defaults..."
+        if ($newSig) {
+            Set-RegistryValue -Path $mailSettingsPath -Name "NewSignature" -Value $newSig -Type String
+            Write-Host "    New email  : $newSig"
+        }
+        if ($replySig) {
+            Set-RegistryValue -Path $mailSettingsPath -Name "ReplySignature" -Value $replySig -Type String
+            Write-Host "    Reply/forward: $replySig"
+        }
+    } else {
+        Write-Host "  No signature defaults found in MailSettings - skipping."
+    }
+
+    Write-Host "  Registry configured."
+}
+
+function Convert-AutocompleteToNk2 {
+    param(
+        [string]$StagedFolder,
+        [string]$Nk2Destination,
+        [string]$Profile
+    )
+
+    $backupCache = Get-ChildItem $StagedFolder -Recurse -Filter "stream_autocomplete*" |
         Sort-Object -Descending -Property Length |
         Select-Object -First 1
 
     if (-not $backupCache) {
-        throw "No stream_autocomplete files found in '$userStaging'."
+        throw "No stream_autocomplete files found in '$StagedFolder'."
     }
     Write-Host "  Using: $($backupCache.Name) ($([math]::Round($backupCache.Length / 1KB, 1)) KB)"
 
-    # Determine registry base path - HKCU for user context, HKU\<SID> for SYSTEM
-    $isSystem = Test-RunningAsSystem
+    $nk2TextFile  = Join-Path $backupCache.DirectoryName "$Profile.nk2"
+    $nk2FinalFile = Join-Path $Nk2Destination "$Profile.nk2"
+
+    if (Test-Path $nk2FinalFile) {
+        Write-Host "  NK2 already exists at '$nk2FinalFile' - skipping conversion."
+        return $nk2FinalFile
+    }
+
+    if (-not (Test-Path $Nk2Destination)) {
+        New-Item -Path $Nk2Destination -ItemType Directory -Force | Out-Null
+    }
+
+    Write-Host "  Converting stream_autocomplete -> text..."
+    & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextFile
+    if (-not (Test-Path $nk2TextFile)) {
+        throw "nk2edit /nk2_to_text failed - output file not created."
+    }
+
+    Write-Host "  Converting text -> NK2 binary..."
+    & $Nk2EditPath /text_to_nk2 $nk2TextFile $nk2FinalFile
+    if (-not (Test-Path $nk2FinalFile)) {
+        throw "nk2edit /text_to_nk2 failed - output file not created."
+    }
+
+    Write-Host "  NK2 staged: $nk2FinalFile"
+    return $nk2FinalFile
+}
+
+#endregion
+
+#region Resolve Target User
+
+if (-not $TargetUser) {
+    if ($Mode -eq "System") {
+        $TargetUser = Get-LoggedInUser
+        if (-not $TargetUser) {
+            throw "Running in System mode but could not detect a logged-in user. Specify -TargetUser."
+        }
+        Write-Host "Detected logged-in user: $TargetUser"
+    } else {
+        $TargetUser = $env:USERNAME
+    }
+}
+
+#endregion
+
+#region System Mode
+
+function Invoke-SystemMigration {
+    Write-Host "=== System Mode: Migrating autocomplete for '$TargetUser' ==="
+
+    if (-not (Test-RunningAsSystem)) {
+        if (-not (Test-IsAdmin)) {
+            throw "System mode requires running as SYSTEM or at least as Administrator."
+        }
+        Write-Warning "Not running as SYSTEM - proceeding as Administrator. Hive loading may fail if the user is logged in."
+    }
+
+    # Export
+    $stagedFolder = Export-AutocompleteCache -Username $TargetUser -Staging $StagingPath
+    if (-not $stagedFolder) { return }
+
+    # Load user registry hive
+    Write-Host "--- Configuring registry via user hive ---"
+    $userSID = Get-UserSID -Username $TargetUser
+    if (-not $userSID) {
+        throw "Could not determine SID for '$TargetUser'."
+    }
+
     $hiveLoaded = $false
-    $regBase = "HKCU:"
-    $userSID = $null
-
-    if ($isSystem) {
-        Write-Host "  Running as SYSTEM - resolving user registry hive..."
-
-        $userSID = Get-UserSID -Username $TargetUser
-        if (-not $userSID) {
-            throw "Could not determine SID for '$TargetUser'."
+    if (Test-Path "Registry::HKU\$userSID") {
+        Write-Host "  User hive already loaded (user is logged in)."
+        $regBase = "Registry::HKU\$userSID"
+    } else {
+        $userProfile = Get-UserProfilePath -Username $TargetUser
+        $ntUserDat = Join-Path $userProfile "NTUSER.DAT"
+        if (-not (Test-Path $ntUserDat)) {
+            throw "NTUSER.DAT not found at '$ntUserDat'."
         }
-
-        if (Test-Path "Registry::HKU\$userSID") {
-            Write-Host "  User hive already loaded (user is logged in)."
-            $regBase = "Registry::HKU\$userSID"
-        } else {
-            $userProfile = Get-UserProfilePath -Username $TargetUser
-            $ntUserDat = Join-Path $userProfile "NTUSER.DAT"
-            if (-not (Test-Path $ntUserDat)) {
-                throw "NTUSER.DAT not found at '$ntUserDat'."
-            }
-            $regLoadResult = reg load "HKU\$userSID" $ntUserDat 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                throw "Failed to load registry hive: $regLoadResult"
-            }
-            $hiveLoaded = $true
-            $regBase = "Registry::HKU\$userSID"
-            Write-Host "  Loaded hive from: $ntUserDat"
+        $regLoadResult = reg load "HKU\$userSID" $ntUserDat 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to load registry hive: $regLoadResult"
         }
+        $hiveLoaded = $true
+        $regBase = "Registry::HKU\$userSID"
+        Write-Host "  Loaded hive from: $ntUserDat"
     }
 
     try {
-        $outlookBase = "$regBase\Software\Microsoft\Office\16.0\Outlook"
-        $identityBase = "$regBase\Software\Microsoft\Office\16.0\Common\Identity"
+        Configure-OutlookRegistry -RegBase $regBase -Profile $ProfileName
 
-        # Configure Outlook profile
-        Write-Host "  Configuring Outlook registry for profile '$ProfileName'..."
-        Set-RegistryValue -Path "$outlookBase\AutoDiscover" -Name "ZeroConfigExchange" -Value 1
-        Set-RegistryValue -Path $outlookBase -Name "DefaultProfile" -Value $ProfileName -Type String
+        # Convert and stage NK2
+        Write-Host "--- Converting autocomplete to NK2 ---"
+        $userProfile = Get-UserProfilePath -Username $TargetUser
+        $nk2Dir = Join-Path $userProfile "AppData\Roaming\Microsoft\Outlook"
+        Convert-AutocompleteToNk2 -StagedFolder $stagedFolder -Nk2Destination $nk2Dir -Profile $ProfileName
 
-        # Ensure profile key exists
-        if (-not (Test-Path "$outlookBase\Profiles\$ProfileName")) {
-            New-Item -Path "$outlookBase\Profiles\$ProfileName" -Force | Out-Null
-        }
-
-        # Enable modern authentication
-        Set-RegistryValue -Path $identityBase -Name "EnableADAL" -Value 1
-
-        # Allow Office 365 autodiscover endpoint
-        Set-RegistryValue -Path "$outlookBase\AutoDiscover" -Name "ExcludeExplicitO365Endpoint" -Value 0
-
-        # Re-apply signature defaults - Outlook resets these per-account when a new profile is
-        # created, so we read the existing values and write them back after profile setup to
-        # ensure they stick as global fallback defaults.
-        $mailSettingsPath = "$regBase\Software\Microsoft\Office\16.0\Common\MailSettings"
-        $existingSettings = Get-ItemProperty -Path $mailSettingsPath -ErrorAction SilentlyContinue
-        $newSig   = $existingSettings.NewSignature
-        $replySig = $existingSettings.ReplySignature
-
-        if ($newSig -or $replySig) {
-            Write-Host "  Re-applying signature defaults..."
-            if ($newSig) {
-                Set-RegistryValue -Path $mailSettingsPath -Name "NewSignature" -Value $newSig -Type String
-                Write-Host "    New email  : $newSig"
-            }
-            if ($replySig) {
-                Set-RegistryValue -Path $mailSettingsPath -Name "ReplySignature" -Value $replySig -Type String
-                Write-Host "    Reply/forward: $replySig"
-            }
+        # Schedule import for next login via RunOnce
+        Write-Host "--- Scheduling NK2 import for next login ---"
+        $outlookExe = Get-OutlookExePath
+        if ($outlookExe) {
+            $runOnceKey = "$regBase\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+            $importCmd = "`"$outlookExe`" /importnk2 /profile `"$ProfileName`""
+            Set-RegistryValue -Path $runOnceKey -Name "OutlookNK2Import" -Value $importCmd -Type String
+            Write-Host "  RunOnce entry created. Outlook will import the NK2 on next login."
         } else {
-            Write-Host "  No signature defaults found in MailSettings - skipping."
+            Write-Warning "Could not find Outlook executable. The user will need to run Outlook manually with:"
+            Write-Warning "  outlook.exe /importnk2 /profile `"$ProfileName`""
         }
-
-        Write-Host "  Registry configured."
-
-        # Convert stream_autocomplete -> nk2 via nk2edit
-        $nk2TextFile = Join-Path $backupCache.DirectoryName "$ProfileName.nk2"
-
-        if ($isSystem) {
-            $userProfile = Get-UserProfilePath -Username $TargetUser
-            $nk2FinalDir = Join-Path $userProfile "AppData\Roaming\Microsoft\Outlook"
-        } else {
-            $nk2FinalDir = Join-Path $env:APPDATA "Microsoft\Outlook"
-        }
-        $nk2FinalFile = Join-Path $nk2FinalDir "$ProfileName.nk2"
-
-        if (Test-Path $nk2FinalFile) {
-            Write-Host "  NK2 already exists at '$nk2FinalFile' - skipping conversion."
-        } else {
-            if (-not (Test-Path $nk2FinalDir)) {
-                New-Item -Path $nk2FinalDir -ItemType Directory -Force | Out-Null
-            }
-
-            Write-Host "  Converting stream_autocomplete -> text..."
-            & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextFile
-            if (-not (Test-Path $nk2TextFile)) {
-                throw "nk2edit /nk2_to_text failed - output file not created. nk2edit may not support running as SYSTEM."
-            }
-
-            Write-Host "  Converting text -> NK2 binary..."
-            & $Nk2EditPath /text_to_nk2 $nk2TextFile $nk2FinalFile
-            if (-not (Test-Path $nk2FinalFile)) {
-                throw "nk2edit /text_to_nk2 failed - output file not created."
-            }
-
-            Write-Host "  NK2 staged: $nk2FinalFile"
-        }
-
-        # Launch Outlook or schedule import for next login
-        if ($isSystem) {
-            Write-Host "  Running as SYSTEM - scheduling NK2 import for next user login..."
-
-            $outlookExe = Get-OutlookExePath
-            if ($outlookExe) {
-                $runOnceKey = "$regBase\Software\Microsoft\Windows\CurrentVersion\RunOnce"
-                $importCmd = "`"$outlookExe`" /importnk2 /profile `"$ProfileName`""
-                Set-RegistryValue -Path $runOnceKey -Name "OutlookNK2Import" -Value $importCmd -Type String
-                Write-Host "  RunOnce entry created. Outlook will import the NK2 on next login."
-            } else {
-                Write-Warning "Could not find Outlook executable. The user will need to run Outlook manually with:"
-                Write-Warning "  outlook.exe /importnk2 /profile `"$ProfileName`""
-            }
-        } else {
-            $outlookExe = Get-OutlookExePath
-            if ($outlookExe) {
-                $runOnceKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
-                $importCmd = "`"$outlookExe`" /importnk2 /profile `"$ProfileName`""
-                Set-RegistryValue -Path $runOnceKey -Name "OutlookNK2Import" -Value $importCmd -Type String
-                Write-Host "  RunOnce entry created. Outlook will import the NK2 on next login."
-            } else {
-                Write-Warning "Could not find Outlook executable. The user will need to run Outlook manually with:"
-                Write-Warning "  outlook.exe /importnk2 /profile `"$ProfileName`""
-            }
-        }
-
-        Write-Host "  Import complete."
     } finally {
-        if ($hiveLoaded -and $userSID) {
+        if ($hiveLoaded) {
             Write-Host "  Unloading user registry hive..."
             [gc]::Collect()
             [gc]::WaitForPendingFinalizers()
@@ -457,21 +438,59 @@ function Import-AutocompleteCache {
 
 #endregion
 
+#region User Mode
+
+function Invoke-UserMigration {
+    Write-Host "=== User Mode: Migrating autocomplete for '$TargetUser' ==="
+
+    # Export
+    $stagedFolder = Export-AutocompleteCache -Username $TargetUser -Staging $StagingPath
+    if (-not $stagedFolder) { return }
+
+    # Configure registry via HKCU
+    Write-Host "--- Configuring registry ---"
+    Configure-OutlookRegistry -RegBase "HKCU:" -Profile $ProfileName
+
+    # Convert and stage NK2
+    Write-Host "--- Converting autocomplete to NK2 ---"
+    $nk2Dir = Join-Path $env:APPDATA "Microsoft\Outlook"
+    Convert-AutocompleteToNk2 -StagedFolder $stagedFolder -Nk2Destination $nk2Dir -Profile $ProfileName
+
+    # Close Outlook and relaunch with NK2 import
+    Write-Host "--- Launching Outlook with NK2 import ---"
+    $outlookExe = Get-OutlookExePath
+    if (-not $outlookExe) {
+        throw "Could not find Outlook executable. Install Outlook or specify the path manually."
+    }
+
+    $outlookProc = Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue
+    if ($outlookProc) {
+        Write-Host "  Closing Outlook..."
+        $outlookProc | ForEach-Object { $_.CloseMainWindow() | Out-Null }
+        Start-Sleep -Seconds 3
+        # Force-kill if still running
+        $outlookProc = Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue
+        if ($outlookProc) {
+            Write-Host "  Outlook didn't close gracefully - forcing..."
+            $outlookProc | Stop-Process -Force
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    Write-Host "  Launching: $outlookExe /importnk2 /profile `"$ProfileName`""
+    Start-Process -FilePath $outlookExe -ArgumentList "/importnk2", "/profile", "`"$ProfileName`""
+    Write-Host "  Outlook launched. Autocomplete cache will be imported."
+}
+
+#endregion
+
 #region Main
 
 switch ($Mode) {
-    "Export" {
-        Export-AutocompleteCache
-    }
-    "Import" {
-        Import-AutocompleteCache
-    }
-    "Full" {
-        Export-AutocompleteCache
-        Import-AutocompleteCache
-    }
+    "System" { Invoke-SystemMigration }
+    "User"   { Invoke-UserMigration }
 }
 
-Write-Host "`nDone. Migration ($Mode) complete for '$TargetUser'."
+Write-Host "`nDone. Migration ($Mode mode) complete for '$TargetUser'."
 
 #endregion
