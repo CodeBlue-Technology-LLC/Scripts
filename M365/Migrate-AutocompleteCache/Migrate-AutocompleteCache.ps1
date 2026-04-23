@@ -335,7 +335,8 @@ function Convert-AutocompleteToNk2 {
     Push-Location (Split-Path $Nk2EditPath -Parent)
     try {
         Write-Host "  Converting stream_autocomplete -> text..."
-        & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextTemp
+        $nk2Out1 = & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextTemp 2>&1
+        if ($nk2Out1) { Write-Host "  nk2edit output: $nk2Out1" }
         if (-not (Test-Path $nk2TextTemp)) {
             throw "nk2edit /nk2_to_text failed - output file not created."
         }
@@ -345,8 +346,15 @@ function Convert-AutocompleteToNk2 {
             throw "nk2edit /nk2_to_text produced an empty file - stream_autocomplete format may not be supported."
         }
 
+        # Show first few lines of the text file so we can verify format
+        $textPreview = Get-Content $nk2TextTemp -TotalCount 5 -ErrorAction SilentlyContinue
+        Write-Host "  Text file preview (first 5 lines):"
+        $textPreview | ForEach-Object { Write-Host "    $_" }
+
         Write-Host "  Converting text -> NK2 binary..."
-        & $Nk2EditPath /text_to_nk2 $nk2TextTemp $nk2BinTemp
+        Write-Host "  Command: $Nk2EditPath /text_to_nk2 $nk2TextTemp $nk2BinTemp"
+        $nk2Out2 = & $Nk2EditPath /text_to_nk2 $nk2TextTemp $nk2BinTemp 2>&1
+        if ($nk2Out2) { Write-Host "  nk2edit output: $nk2Out2" }
         if (-not (Test-Path $nk2BinTemp)) {
             throw "nk2edit /text_to_nk2 failed - output file not created."
         }
