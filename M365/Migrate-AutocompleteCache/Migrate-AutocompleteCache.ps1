@@ -318,7 +318,7 @@ function Convert-AutocompleteToNk2 {
 
     # Use space-free temp paths in the staging folder - nk2edit parses its own
     # command line and fails silently when paths contain spaces.
-    $nk2TextTemp  = Join-Path $StagingPath "autocomplete_export.tmp"
+    $nk2TextTemp  = Join-Path $StagingPath "autocomplete_export.txt"
     $nk2BinTemp   = Join-Path $StagingPath "autocomplete_import.nk2"
     $nk2FinalFile = Join-Path $Nk2Destination "$Profile.nk2"
 
@@ -338,6 +338,11 @@ function Convert-AutocompleteToNk2 {
         & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextTemp
         if (-not (Test-Path $nk2TextTemp)) {
             throw "nk2edit /nk2_to_text failed - output file not created."
+        }
+        $textSize = (Get-Item $nk2TextTemp).Length
+        Write-Host "  Text file size: $textSize bytes"
+        if ($textSize -eq 0) {
+            throw "nk2edit /nk2_to_text produced an empty file - stream_autocomplete format may not be supported."
         }
 
         Write-Host "  Converting text -> NK2 binary..."
