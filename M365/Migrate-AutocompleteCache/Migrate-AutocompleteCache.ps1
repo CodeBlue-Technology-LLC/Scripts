@@ -331,16 +331,22 @@ function Convert-AutocompleteToNk2 {
         New-Item -Path $Nk2Destination -ItemType Directory -Force | Out-Null
     }
 
-    Write-Host "  Converting stream_autocomplete -> text..."
-    & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextTemp
-    if (-not (Test-Path $nk2TextTemp)) {
-        throw "nk2edit /nk2_to_text failed - output file not created."
-    }
+    # nk2edit must run from its own directory
+    Push-Location (Split-Path $Nk2EditPath -Parent)
+    try {
+        Write-Host "  Converting stream_autocomplete -> text..."
+        & $Nk2EditPath /nk2_to_text $backupCache.FullName $nk2TextTemp
+        if (-not (Test-Path $nk2TextTemp)) {
+            throw "nk2edit /nk2_to_text failed - output file not created."
+        }
 
-    Write-Host "  Converting text -> NK2 binary..."
-    & $Nk2EditPath /text_to_nk2 $nk2TextTemp $nk2BinTemp
-    if (-not (Test-Path $nk2BinTemp)) {
-        throw "nk2edit /text_to_nk2 failed - output file not created."
+        Write-Host "  Converting text -> NK2 binary..."
+        & $Nk2EditPath /text_to_nk2 $nk2TextTemp $nk2BinTemp
+        if (-not (Test-Path $nk2BinTemp)) {
+            throw "nk2edit /text_to_nk2 failed - output file not created."
+        }
+    } finally {
+        Pop-Location
     }
 
     Copy-Item $nk2BinTemp $nk2FinalFile
