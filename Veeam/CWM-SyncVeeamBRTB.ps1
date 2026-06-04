@@ -19,8 +19,12 @@
 $ErrorActionPreference = 'Stop'
 
 #import configuration, prompt to create if it doesn't exist
-$ConfigPath = "Config\Credentials.xml"
+$ConfigDir  = Join-Path $PSScriptRoot 'Config'
+$ConfigPath = Join-Path $ConfigDir 'Credentials.xml'
 if (-not (Test-Path $ConfigPath)) {
+    if (-not (Test-Path $ConfigDir)) {
+        New-Item -ItemType Directory -Path $ConfigDir | Out-Null
+    }
     Write-Host "No configuration found. Please enter the following details." -ForegroundColor Yellow
 
     $ServerName = Read-Host -Prompt "Enter the Veeam B&R server name (e.g., servername.domain.local)"
@@ -56,15 +60,30 @@ $ProductId = $Config.ProductId
 
 try {
     #connection for ConnectWise powershell module
-    if (Get-Module -ListAvailable -Name ConnectWiseManageAPI) { Connect-CWM @CWMConnectionInfo } else { Install-Module 'ConnectWiseManageAPI'; Connect-CWM @CWMConnectionInfo }
+    if (-not (Get-Module -ListAvailable -Name ConnectWiseManageAPI)) {
+        Install-Module 'ConnectWiseManageAPI' -Force -Scope CurrentUser
+    }
+    Import-Module ConnectWiseManageAPI
+    try {
+        Connect-CWM @CWMConnectionInfo
+    }
+    catch {
+        throw "Connect-CWM failed: $($_.Exception.Message)"
+    }
 
     #connection for Veeam B&R powershell module
     Import-Module Veeam.Backup.PowerShell
     Disconnect-VBRServer -ErrorAction SilentlyContinue
-    Connect-VBRServer -Server $ServerName -Credential $Credential
+    try {
+        Connect-VBRServer -Server $ServerName -Credential $Credential
+    }
+    catch {
+        throw "Connect-VBRServer failed: $($_.Exception.Message)"
+    }
 }
 catch {
     Write-Host "Failed to connect: $_" -ForegroundColor Red
+    Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
     exit 1
 }
 
