@@ -152,7 +152,7 @@ foreach ($Folder in $AllFolders) {
 
     # Find the VHDX inside - skip metadata files
     $VHDX = Get-ChildItem -Path $Folder.FullName -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Extension -ieq ".vhdx" } |
+        Where-Object { $_.Extension -imatch '\.(vhd|vhdx)$' } |
         Select-Object -First 1
 
     if ($null -eq $VHDX) {
