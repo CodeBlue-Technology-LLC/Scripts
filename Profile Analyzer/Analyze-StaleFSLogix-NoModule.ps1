@@ -151,9 +151,9 @@ foreach ($Folder in $AllFolders) {
     $Username = $Folder.Name.Substring($SplitIdx + 1)
 
     # Find the VHDX inside - skip metadata files
-    $VHDX = Get-ChildItem -Path $Folder.FullName -Filter "Profile_*.VHDX" -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -ieq ".vhdx" } |
-            Select-Object -First 1
+    $VHDX = Get-ChildItem -Path $Folder.FullName -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -ieq ".vhdx" } |
+        Select-Object -First 1
 
     if ($null -eq $VHDX) {
         Write-Host "[WARN] No Profile VHDX found in: $($Folder.Name)" -ForegroundColor DarkYellow
