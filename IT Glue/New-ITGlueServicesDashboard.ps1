@@ -230,6 +230,31 @@ function Initialize-Credentials {
         $changed = $true
     }
 
+    if (-not $creds.Automate) {
+        if ((Read-Host "Configure ConnectWise Automate (device links)? (y/N)") -match '^[Yy]') {
+            $autoUrl = (Read-Host "  Automate URL (e.g. https://automate.yourdomain.com)").TrimEnd('/')
+            $autoCid = Read-Host "  Automate API Client ID (GUID)"
+            $autoUsr = Read-Host "  Automate API username (local-login capable)"
+            $autoPwd = Read-Host "  Automate API password"
+            $creds.Automate = @{ Configured = $true; Url = $autoUrl; ClientId = $autoCid; Username = $autoUsr; Password = $autoPwd }
+        } else { $creds.Automate = @{ Configured = $false } }
+        $changed = $true
+    }
+
+    if (-not $creds.CIPP) {
+        if ((Read-Host "Configure CIPP (M365 - MFA / AD sync)? (y/N)") -match '^[Yy]') {
+            $cippUrl = (Read-Host "  CIPP API URL (e.g. https://cippXXXX.azurewebsites.net)").TrimEnd('/')
+            $cippTen = Read-Host "  CIPP/partner Tenant ID (GUID)"
+            $cippCid = Read-Host "  API client Application (client) ID"
+            $cippSec = Read-Host "  API client Secret"
+            $creds.CIPP = @{
+                Configured = $true; ApiUrl = $cippUrl; TenantId = $cippTen
+                ClientId = $cippCid; ClientSecret = $cippSec; Scope = "api://$cippCid/.default"
+            }
+        } else { $creds.CIPP = @{ Configured = $false } }
+        $changed = $true
+    }
+
     if ($changed) {
         $creds | Export-Clixml -Path $CredentialsPath
         Write-Status "Credentials saved to $CredentialsPath" Success
@@ -617,17 +642,18 @@ function Get-VspcCompanyBackup {
     # NOTE: no reliable used-storage (TB) endpoint in this VSPC build - backupResources returns the
     # SPA - so TB is omitted for now (see follow-up notes). operationMode gives Server/Workstation.
     param([string]$BaseURL, [string]$Token, [string]$CompanyUid)
-    $result = [pscustomobject]@{ Servers = 0; Workstations = 0; VMs = 0 }
+    # Returns the NAMES of protected workloads per type (not just counts).
+    $result = [pscustomobject]@{ Servers = @(); Workstations = @(); VMs = @() }
     try {
         $vms = Get-VspcPaged -BaseURL $BaseURL -Token $Token -Path '/api/v3/protectedWorkloads/virtualMachines' |
             Where-Object { $_.organizationUid -eq $CompanyUid }
-        $result.VMs = @($vms).Count
+        $result.VMs = @($vms | ForEach-Object { $_.name } | Where-Object { $_ } | Sort-Object)
     } catch { }
     try {
         $agents = Get-VspcPaged -BaseURL $BaseURL -Token $Token -Path '/api/v3/protectedWorkloads/computersManagedByConsole' |
             Where-Object { $_.organizationUid -eq $CompanyUid }
-        $result.Servers      = @($agents | Where-Object { $_.operationMode -eq 'Server' }).Count
-        $result.Workstations = @($agents | Where-Object { $_.operationMode -eq 'Workstation' }).Count
+        $result.Servers      = @($agents | Where-Object { $_.operationMode -eq 'Server' }      | ForEach-Object { $_.name } | Sort-Object)
+        $result.Workstations = @($agents | Where-Object { $_.operationMode -eq 'Workstation' } | ForEach-Object { $_.name } | Sort-Object)
     } catch { }
     return $result
 }
@@ -698,36 +724,63 @@ function Get-ItgFlexAssetTypeId {
 }
 
 # ==============================================================================
-# Tile providers - each returns a normalized tile object
-#   @{ Title; Shading; Content; Detail; Link; IsInfo; InfoItems }
+# Brand styling (colors + logos) via Brandfetch
+# Known brands are baked below (accent color + light/colored icon URL) so rendering makes no API
+# call; any unmapped domain is resolved live and cached. The API key is hard-coded per request.
+# SECURITY: this key is visible to anyone with the repo - restrict it in Brandfetch (domain
+# allowlist) or rotate if the repo is shared.
 # ==============================================================================
-function New-Tile {
-    param(
-        [string]$Title, [string]$Shading, [string]$Content = '', [string]$Detail = '',
-        [string]$Link = '', [switch]$IsInfo, [object[]]$InfoItems = @()
-    )
-    [pscustomobject]@{
-        Title = $Title; Shading = $Shading; Content = $Content; Detail = $Detail
-        Link = $Link; IsInfo = [bool]$IsInfo; InfoItems = $InfoItems
-    }
+$script:BrandfetchApiKey = 'ob7cfkVJLOtwFWiIVN60OjkZywKeFtvnS6l95rfZ7oC0cGUHDtjhcpy_Kt9JuX6l96rWcyWYyP_zCn5D3MPZHA'
+$script:BrandMap = @{
+    'itglue.com'      = @{ Color = '#3860be'; Logo = 'https://cdn.brandfetch.io/idwyCKX16_/w/350/h/350/theme/dark/icon.jpeg?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    'connectwise.com' = @{ Color = '#5ea4de'; Logo = 'https://cdn.brandfetch.io/idejubPisD/w/400/h/400/theme/dark/icon.jpeg?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    'sentinelone.com' = @{ Color = '#6b0aea'; Logo = 'https://cdn.brandfetch.io/idqbZJLrXa/w/400/h/400/theme/dark/icon.png?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    'bitdefender.com' = @{ Color = '#EB0000'; Logo = 'https://cdn.brandfetch.io/idtcaX4QNF/w/400/h/400/theme/dark/icon.png?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    'duo.com'         = @{ Color = '#74bf4b'; Logo = 'https://cdn.brandfetch.io/id7s-uuKhk/w/400/h/400/theme/dark/icon.png?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    'veeam.com'       = @{ Color = '#03D15F'; Logo = 'https://cdn.brandfetch.io/idVHk_jeH3/w/400/h/400/theme/dark/icon.jpeg?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    'n-able.com'      = @{ Color = '#c046ff'; Logo = 'https://cdn.brandfetch.io/idpmq52ZKx/w/400/h/400/theme/dark/icon.jpeg?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    'microsoft.com'   = @{ Color = '#00A4EF'; Logo = 'https://cdn.brandfetch.io/idchmboHEZ/w/800/h/800/theme/dark/symbol.png?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    # ConnectWise Automate: no Brandfetch entry / favicon - logo is an inlined data URI (downscaled
+    # from the supplied automate.png) so it's self-contained.
+    'automate'        = @{ Color = '#57b947'; Logo = 'data:image/png;base64,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' }
+}
+function Resolve-Brand {
+    param([string]$Domain)
+    if ([string]::IsNullOrWhiteSpace($Domain)) { return $null }
+    if ($script:BrandMap.ContainsKey($Domain)) { return $script:BrandMap[$Domain] }
+    try {
+        $b = Invoke-RestMethod -Uri "https://api.brandfetch.io/v2/brands/$Domain" -TimeoutSec 20 `
+            -Headers @{ Authorization = "Bearer $($script:BrandfetchApiKey)" }
+        $color = ($b.colors | Where-Object { $_.type -eq 'accent' } | Select-Object -First 1).hex
+        if (-not $color) { $color = ($b.colors | Where-Object { $_.type -eq 'brand' } | Select-Object -First 1).hex }
+        $icon = $b.logos | Where-Object { $_.type -in 'icon','symbol' } | Select-Object -First 1
+        $fmt  = $icon.formats | Where-Object { $_.format -eq 'png' } | Select-Object -First 1
+        if (-not $fmt) { $fmt = $icon.formats | Select-Object -First 1 }
+        $entry = @{ Color = $color; Logo = $fmt.src }
+        $script:BrandMap[$Domain] = $entry
+        return $entry
+    } catch { return $null }
 }
 
-function New-CategoryTile {
-    # One tile per category (Antivirus, Backup, MFA...) listing EVERY active product as a
-    # "Product: value" line. Green when any product is present; red 'None' when the client has none.
-    # Each line is either a plain string, or an object @{ Text; Link } to render the line as a link.
-    param([string]$Title, [object[]]$Lines)
-    if (-not $Lines -or $Lines.Count -eq 0) { return New-Tile -Title $Title -Shading 'danger' -Content 'None' }
-    $items = foreach ($l in $Lines) {
-        if ($l -is [string]) {
-            [pscustomobject]@{ Shading = 'success'; AlertText = (Get-HtmlEncoded $l) }
-        } else {
-            $txt  = Get-HtmlEncoded $l.Text
-            $html = if ($l.Link) { "<a href=`"$($l.Link)`">$txt</a>" } else { $txt }
-            [pscustomobject]@{ Shading = 'success'; AlertText = $html }
-        }
-    }
-    return New-Tile -Title $Title -Shading 'success' -IsInfo -InfoItems $items
+# ==============================================================================
+# Tile providers - each returns a card object: @{ Title; Items[] }
+# An item is @{ Label; Sub; Link; Brand; Bg; Muted; Kind }:
+#   Brand -> domain key into BrandMap; sets the logo + accent color.
+#   Bg    -> explicit background colour that overrides everything (e.g. red for an alert).
+#   Muted -> force the neutral translucent background even with a brand (secondary 365/license lines).
+#   Kind 'pill' = logo + Label button; Kind 'number' = big Label over small Sub (always muted, no logo).
+# ==============================================================================
+function New-CardItem {
+    param(
+        [string]$Label, [string]$Sub = '', [string]$Link = '', [string]$Brand = '',
+        [string]$Bg = '', [switch]$Muted, [ValidateSet('pill','number')][string]$Kind = 'pill'
+    )
+    [pscustomobject]@{ Label = $Label; Sub = $Sub; Link = $Link; Brand = $Brand; Bg = $Bg; Muted = [bool]$Muted; Kind = $Kind }
+}
+
+function New-Card {
+    param([string]$Title, [object[]]$Items)
+    [pscustomobject]@{ Title = $Title; Items = @($Items) }
 }
 
 function Get-DashAntivirus {
@@ -742,7 +795,8 @@ function Get-DashAntivirus {
             catch { Write-Status "  SentinelOne $($inst.Name) query failed: $($_.Exception.Message)" Warning }
         }
         $site = Resolve-OrgServiceId -Entry $Entry -VendorKey 'sentinelOne' -VendorLabel 'SentinelOne' -OrgName $OrgName -Candidates $sites
-        if ($site) { $lines += "SentinelOne: $([int]$site.ActiveLicenses)" }
+        # Hide a 0-count product (matched by name but protecting nothing).
+        if ($site -and [int]$site.ActiveLicenses -gt 0) { $lines += New-CardItem -Label "$([int]$site.ActiveLicenses) devices" -Brand 'sentinelone.com' }
     }
 
     if ($Creds.Bitdefender.Configured) {
@@ -752,11 +806,11 @@ function Get-DashAntivirus {
         $company = Resolve-OrgServiceId -Entry $Entry -VendorKey 'bitdefender' -VendorLabel 'Bitdefender' -OrgName $OrgName -Candidates $companies
         if ($company) {
             $count = Get-BdEndpointCount -BaseURL $Creds.Bitdefender.URL -ApiKey $Creds.Bitdefender.ApiKey -CompanyId $company.Id
-            $lines += "Bitdefender: $([int]$count)"
+            if ([int]$count -gt 0) { $lines += New-CardItem -Label "$([int]$count) devices" -Brand 'bitdefender.com' }
         }
     }
 
-    return New-CategoryTile -Title 'Antivirus' -Lines $lines
+    return New-Card -Title 'Endpoint Security' -Items $lines
 }
 
 function Get-DashMfa {
@@ -779,12 +833,12 @@ function Get-DashMfa {
             $adminUrl = if ($acct.ApiHostname) { 'https://' + ($acct.ApiHostname -replace '^api-', 'admin-') } else { '' }
             try {
                 $c = Get-DuoUserCounts -Creds $Creds -AccountId $acct.Id
-                $lines += [pscustomobject]@{ Text = "Duo: $($c.Active) active, $($c.Bypass) bypass"; Link = $adminUrl }
+                $lines += New-CardItem -Label "Duo: $($c.Active) active, $($c.Bypass) bypass" -Link $adminUrl -Brand 'duo.com'
             }
-            catch { Write-Status "  Duo user count failed for '$($acct.Name)': $($_.Exception.Message)" Warning; $lines += "Duo: n/a" }
+            catch { Write-Status "  Duo user count failed for '$($acct.Name)': $($_.Exception.Message)" Warning; $lines += New-CardItem -Label 'Duo: n/a' -Brand 'duo.com' }
         }
     }
-    return New-CategoryTile -Title 'MFA' -Lines $lines
+    return New-Card -Title 'MFA' -Items $lines
 }
 
 function Get-DashBackup {
@@ -801,9 +855,10 @@ function Get-DashBackup {
             $company = Resolve-OrgServiceId -Entry $Entry -VendorKey 'veeam' -VendorLabel 'Veeam VSPC' -OrgName $OrgName -Candidates $companies
             if ($company) {
                 $b = Get-VspcCompanyBackup -BaseURL $Creds.VeeamVspc.URL -Token $token -CompanyUid $company.Id
-                $total = [int]$b.Servers + [int]$b.Workstations + [int]$b.VMs
-                if ($total -gt 0) {
-                    $lines += "Veeam: $($b.Servers) srv, $($b.Workstations) wks, $($b.VMs) VM"
+                # List protected device names, ordered servers -> workstations -> VMs.
+                $names = @($b.Servers) + @($b.Workstations) + @($b.VMs)
+                if ($names.Count -gt 0) {
+                    $lines += New-CardItem -Label "Veeam: $($names -join ', ')" -Brand 'veeam.com'
                 }
             }
         } catch { Write-Status "  Veeam VSPC query failed: $($_.Exception.Message)" Warning }
@@ -823,19 +878,19 @@ function Get-DashBackup {
                     $servers = @($endpoint | Where-Object { $_.OSType -match 'server' }).Count
                     $workstations = $endpoint.Count - $servers
                     $tb = [Math]::Round((($endpoint | Measure-Object -Property UsedGB -Sum).Sum) / 1024, 2)
-                    $lines += "Cove: $tb TB ($servers srv, $workstations wks)"
+                    $lines += New-CardItem -Label "Cove: $tb TB ($servers srv, $workstations wks)" -Brand 'n-able.com'
                 }
                 $m365 = @($devices | Where-Object { "$($_.Physicality)" -eq 'Undefined' })
                 if ($m365.Count -gt 0) {
                     $tb365 = [Math]::Round((($m365 | Measure-Object -Property UsedGB -Sum).Sum) / 1024, 2)
                     $tenants = if ($m365.Count -eq 1) { '1 tenant' } else { "$($m365.Count) tenants" }
-                    $lines += "Cove 365: $tb365 TB ($tenants)"
+                    $lines += New-CardItem -Label "Cove 365: $tb365 TB ($tenants)" -Brand 'n-able.com' -Muted
                 }
             }
         } catch { Write-Status "  Cove query failed: $($_.Exception.Message)" Warning }
     }
 
-    return New-CategoryTile -Title 'Backup' -Lines $lines
+    return New-Card -Title 'Backup' -Items $lines
 }
 
 function Get-DashDomains {
@@ -846,40 +901,99 @@ function Get-DashDomains {
         if ($res.data) { $domains = $res.data }
     } catch { Write-Status "  IT Glue domains query failed: $($_.Exception.Message)" Warning }
 
-    if (-not $domains -or $domains.Count -eq 0) {
-        return New-Tile -Title 'Domains' -Shading 'danger' -Content 'No Domains'
-    }
-
     $items = foreach ($d in ($domains | Sort-Object { $_.attributes.name })) {
-        $name = Get-HtmlEncoded $d.attributes.name
-        $href = "$LinkBase/domains/$($d.id)"
-        [pscustomobject]@{ Shading = 'info'; AlertText = "<a href=`"$href`">$name</a>" }
+        # Muted pill, no icon (matches the design's domain list).
+        New-CardItem -Label $d.attributes.name -Link "$LinkBase/domains/$($d.id)"
     }
-    return New-Tile -Title 'Domains' -Shading 'info' -IsInfo -InfoItems $items
+    return New-Card -Title 'Domains' -Items $items
+}
+
+# ---- CIPP (M365 data via the CIPP API: MFA + Entra/AD sync) ----
+function Invoke-CippGraph {
+    # Proxy a Graph request through CIPP (handles the multi-tenant GDAP auth for us).
+    param([string]$TenantFilter, [string]$Endpoint)
+    $uri = "$($script:CippApiUrl)/api/ListGraphRequest?TenantFilter=$([uri]::EscapeDataString($TenantFilter))&Endpoint=$([uri]::EscapeDataString($Endpoint))"
+    $r = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $($script:CippToken)" }
+    if ($r -isnot [array] -and ($r.PSObject.Properties.Name -contains 'Results')) { return $r.Results }
+    return $r
+}
+function Resolve-CippTenant {
+    # Map the IT Glue org to its CIPP/M365 tenant. We query ListTenants?TenantFilter=<domain> for each
+    # of the org's IT Glue domains; the tenant's DEFAULT domain resolves to a single clean tenant
+    # (secondary domains 400 in Graph, and CIPP's occasional aggregated all-tenants row - a single
+    # object whose defaultDomainName is many domains joined by spaces - is rejected). Cached on success;
+    # a miss is NOT cached (re-resolve next run) so transient CIPP responses can't poison the cache.
+    param([pscustomobject]$Entry, [string]$OrgId)
+    if (-not $script:CippConnected) { return $null }
+    $cached = $Entry.PSObject.Properties['cipp']
+    if ($cached -and $cached.Value -and "$($cached.Value.Domain)" -notmatch '\s') { return $cached.Value }
+
+    $orgDomains = @()
+    try { $orgDomains = @((Get-ITGlueDomains -filter_organization_id $OrgId).data.attributes.name) } catch {}
+    $orgDomains = @($orgDomains | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
+
+    $match = $null
+    foreach ($d in $orgDomains) {
+        $t = $null
+        try { $t = @(Invoke-RestMethod -Uri "$($script:CippApiUrl)/api/ListTenants?TenantFilter=$([uri]::EscapeDataString($d))" -Headers @{ Authorization = "Bearer $($script:CippToken)" })[0] } catch {}
+        if ($t -and $t.defaultDomainName -and "$($t.defaultDomainName)" -notmatch '\s') { $match = $t; break }
+    }
+    if (-not $match) { return $null }
+    $cid = if ($match.customerId) { $match.customerId } else { $match.RowKey }
+    $val = [pscustomobject]@{ Id = "$cid"; Name = $match.displayName; Domain = $match.defaultDomainName }
+    $Entry | Add-Member -NotePropertyName 'cipp' -NotePropertyValue $val -Force
+    $script:ServiceMapDirty = $true
+    return $val
+}
+function Get-CippMfaItem {
+    param([string]$TenantFilter)
+    try {
+        $rows = @(Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint 'reports/authenticationMethods/userRegistrationDetails')
+        $reg  = @($rows | Where-Object { $_.isMfaRegistered -eq $true }).Count
+        return New-CardItem -Label "MFA: $reg/$($rows.Count)" -Brand 'microsoft.com' -Muted
+    } catch { Write-Status "  CIPP MFA query failed: $($_.Exception.Message)" Warning; return $null }
+}
+function Get-CippSyncItem {
+    param([string]$TenantFilter)
+    try {
+        $o = @(Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint 'organization')[0]
+        if ($o.onPremisesSyncEnabled) {
+            $rel = ''
+            if ($o.onPremisesLastSyncDateTime) {
+                $span = (Get-Date).ToUniversalTime() - ([datetime]$o.onPremisesLastSyncDateTime).ToUniversalTime()
+                $rel  = if ($span.TotalMinutes -lt 60) { " ($([int]$span.TotalMinutes)m ago)" }
+                        elseif ($span.TotalHours -lt 24) { " ($([int]$span.TotalHours)h ago)" }
+                        else { " ($([int]$span.TotalDays)d ago)" }
+            }
+            return New-CardItem -Label "AD Sync: Synced$rel" -Brand 'microsoft.com' -Muted
+        }
+        return New-CardItem -Label 'AD Sync: Cloud-only' -Brand 'microsoft.com' -Muted
+    } catch { Write-Status "  CIPP org/sync query failed: $($_.Exception.Message)" Warning; return $null }
 }
 
 function Get-DashM365 {
-    param([string]$OrgId, [string]$LinkBase, [ref]$HasM365Out)
-    $typeId = Get-ItgFlexAssetTypeId -NameLike @('*Microsoft Licenses*','*Office 365 Licenses*','*Microsoft 365 Licenses*')
-    if (-not $typeId) {
-        $HasM365Out.Value = $false
-        return New-Tile -Title 'M365 Licenses' -Shading 'danger' -Content 'No M365'
-    }
-
-    $assets = @()
-    try {
-        $res = Get-ITGlueFlexibleAssets -filter_flexible_asset_type_id $typeId -filter_organization_id $OrgId
-        if ($res.data) { $assets = $res.data }
-    } catch { Write-Status "  M365 license asset query failed: $($_.Exception.Message)" Warning }
-
-    if (-not $assets -or $assets.Count -eq 0) {
-        $HasM365Out.Value = $false
-        return New-Tile -Title 'M365 Licenses' -Shading 'danger' -Content 'No M365'
-    }
-    $HasM365Out.Value = $true
-
-    # Build a license list. The synced trait names vary, so probe common keys per asset.
+    # M365 card: MFA + AD-sync (via CIPP, tenant matched by domain) on top, then the license list.
+    param([pscustomobject]$Entry, [string]$OrgId, [string]$LinkBase)
     $items = @()
+
+    if ($script:CippConnected) {
+        $tenant = Resolve-CippTenant -Entry $Entry -OrgId $OrgId
+        if ($tenant) {
+            $mfa  = Get-CippMfaItem  -TenantFilter $tenant.Domain; if ($mfa)  { $items += $mfa }
+            $sync = Get-CippSyncItem -TenantFilter $tenant.Domain; if ($sync) { $items += $sync }
+        }
+    }
+
+    # Licenses from the IT Glue Microsoft Licenses flexible asset. The synced trait names vary, so
+    # probe common keys per asset.
+    $typeId = Get-ItgFlexAssetTypeId -NameLike @('*Microsoft Licenses*','*Office 365 Licenses*','*Microsoft 365 Licenses*')
+    $assets = @()
+    if ($typeId) {
+        try {
+            $res = Get-ITGlueFlexibleAssets -filter_flexible_asset_type_id $typeId -filter_organization_id $OrgId
+            if ($res.data) { $assets = $res.data }
+        } catch { Write-Status "  M365 license asset query failed: $($_.Exception.Message)" Warning }
+    }
     foreach ($a in $assets) {
         $traits = $a.attributes.traits
         $skuName = $null; $active = $null; $consumed = $null
@@ -902,12 +1016,14 @@ function Get-DashM365 {
         # Real paid licenses have a specific seat count under 1000. Skip when we parsed such a total.
         if ($null -ne $active -and ([int]$active -le 0 -or [int]$active -ge 1000)) { continue }
 
-        $label = if ($skuName) { Get-HtmlEncoded $skuName } else { Get-HtmlEncoded $a.attributes.name }
+        $label = if ($skuName) { $skuName } else { $a.attributes.name }
         if ($null -ne $consumed -and $null -ne $active) { $label += " - $consumed/$active" }
-        $href = "$LinkBase/assets/$($a.id)"
-        $items += [pscustomobject]@{ Shading = 'success'; AlertText = "<a href=`"$href`">$label</a>" }
+        # Over-provisioned (consumed > purchased, e.g. 4/3) -> red alert pill; otherwise muted.
+        $over = ($null -ne $consumed -and $null -ne $active -and [int]$consumed -gt [int]$active)
+        $bg   = if ($over) { '#DC3545' } else { '' }
+        $items += New-CardItem -Label $label -Link "$LinkBase/assets/$($a.id)" -Brand 'microsoft.com' -Muted -Bg $bg
     }
-    return New-Tile -Title 'M365 Licenses' -Shading 'info' -IsInfo -InfoItems $items
+    return New-Card -Title 'M365' -Items $items
 }
 
 # ---- Users (IT Glue contacts + ConnectWise contacts) ----
@@ -938,29 +1054,50 @@ function Get-CwmActiveContactCount {
     try { return @(Get-CWMContact -condition "company/id=$CompanyId and inactiveFlag=false" -all).Count } catch { return $null }
 }
 
+function Get-CwmMemberQty {
+    # Quantity of part CBT-PF-MEMBER on the company's "IT Services Agreement - PeopleFirst Support"
+    # (agreement type "IT Services Agreement"). Returns $null if the company has no such agreement
+    # (so the Users card skips the pill); 0 if the agreement exists but carries no member seats.
+    param([string]$CompanyId)
+    try {
+        $agr = Get-CWMAgreement -condition "company/id=$CompanyId and name='IT Services Agreement - PeopleFirst Support' and type/name='IT Services Agreement'" |
+            Select-Object -First 1
+        if (-not $agr) { return $null }
+        $adds = Get-CWMAgreementAddition -AgreementID $agr.id -condition "product/identifier='CBT-PF-MEMBER'" -all
+        return [int](($adds | Measure-Object -Property quantity -Sum).Sum)
+    } catch { return $null }
+}
+
 function Get-DashUsers {
     param([pscustomobject]$Entry, [string]$OrgId, [string]$OrgName, [string]$LinkBase, [hashtable]$Creds)
     $items = @()
-    # IT Glue: contacts have no active/inactive concept, so this is the org's total contact count.
-    $itg = Get-ItgContactCount -OrgId $OrgId
-    $itgLabel = if ($null -ne $itg) { "IT Glue: $itg" } else { "IT Glue: n/a" }
-    $items += [pscustomobject]@{ Shading = 'info'; AlertText = "<a href=`"$LinkBase/contacts`">$itgLabel</a>" }
-    # ConnectWise: active contacts for the matched company. CW Manage can't deep-link a company's
-    # Contacts tab (that state is an opaque LZMA-compressed URL fragment), so we link to the
-    # company's BILLING CONTACT record (lands directly in a contact); fall back to the company record.
+    # ConnectWise first (on top of IT Glue). CW Manage can't deep-link a company's Contacts tab (that
+    # state is an opaque LZMA-compressed URL fragment), so the contacts pill links to the company's
+    # BILLING CONTACT record (falls back to the company record).
     if ($script:CwmConnected) {
         $co = Resolve-CwmCompany -Entry $Entry -OrgName $OrgName
         if ($co) {
+            # Agreement on top: PeopleFirst member seats (CBT-PF-MEMBER qty on the PeopleFirst Support
+            # agreement). Skipped entirely if the company has no such agreement.
+            $memQty = Get-CwmMemberQty -CompanyId $co.Id
+            if ($null -ne $memQty) { $items += New-CardItem -Label "Agreement: $memQty" -Brand 'connectwise.com' }
+
+            # Then CWM contacts (links to the company's billing contact / company record).
             $cw = Get-CwmActiveContactCount -CompanyId $co.Id
             $base = "https://$($Creds.CWM.ConnectionInfo.Server)/v4_6_release/services/system_io/router/openrecord.rails"
             $billId = $null
             try { $billId = (Get-CWMCompany -id $co.Id).billingContact.id } catch {}
             $cwHref = if ($billId) { "$base`?recordType=ContactFV&recid=$billId" } else { "$base`?recordType=CompanyFV&recid=$($co.Id)" }
-            $cwLabel = if ($null -ne $cw) { "ConnectWise: $cw" } else { "ConnectWise: n/a" }
-            $items += [pscustomobject]@{ Shading = 'info'; AlertText = "<a href=`"$cwHref`">$cwLabel</a>" }
+            $cwLabel = if ($null -ne $cw) { "Contacts: $cw" } else { "Contacts: n/a" }
+            $items += New-CardItem -Label $cwLabel -Link $cwHref -Brand 'connectwise.com'
         }
     }
-    return New-Tile -Title 'Users' -Shading 'info' -IsInfo -InfoItems $items
+    # IT Glue contacts (no active/inactive concept in IT Glue -> total contacts for the org).
+    $itg = Get-ItgContactCount -OrgId $OrgId
+    $itgLabel = if ($null -ne $itg) { "Contacts: $itg" } else { "Contacts: n/a" }
+    $items += New-CardItem -Label $itgLabel -Link "$LinkBase/contacts" -Brand 'itglue.com'
+
+    return New-Card -Title 'Users' -Items $items
 }
 
 # ---- Workstations / Servers (IT Glue configurations, by type + Active status) ----
@@ -974,66 +1111,150 @@ function Get-ItgConfigStatusId {
     foreach ($s in (Get-ITGlueConfigurationStatuses).data) { if ($s.attributes.name -ieq $Name) { return $s.id } }
     return $null
 }
-function Get-DashConfigTile {
-    param([string]$Title, [string]$OrgId, [string]$LinkBase, [string]$TypeId, [string]$TypeName, [string]$StatusId)
-    if (-not $TypeId -or -not $StatusId) { return New-Tile -Title $Title -Shading 'warning' -Content 'n/a' }
+function Resolve-AutomateClient {
+    # Match the IT Glue org to a ConnectWise Automate client and cache its client Id (the Automate
+    # companyId used in the computers URL) under 'automate'. We query clients?condition=Name contains
+    # '<token>' (the bulk clients list intermittently returns one aggregated row), then normalized-match.
+    # A miss is NOT cached (re-resolve next run) so a flaky response can't poison the cache.
+    param([pscustomobject]$Entry, [string]$OrgName)
+    if (-not $script:AutomateConnected) { return $null }
+    $cached = $Entry.PSObject.Properties['automate']
+    if ($cached -and $cached.Value) { return $cached.Value.Id }
+
+    $target = ConvertTo-NormalizedName $OrgName
+    $token  = ($OrgName -split '[ ,]+' | Where-Object { $_.Length -ge 4 } | Select-Object -First 1)
+    if (-not $token) { $token = $OrgName }
+    $cands = @()
+    try {
+        $cond  = "Name contains '$($token -replace "'","''")'"
+        $cands = @(Invoke-RestMethod -Uri "$($script:AutomateUrl)/cwa/api/v1/clients?condition=$([uri]::EscapeDataString($cond))&pagesize=200" -Headers $script:AutomateHeaders)
+    } catch { Write-Status "  Automate client query failed: $($_.Exception.Message)" Warning }
+    $m = $cands | Where-Object { (ConvertTo-NormalizedName $_.Name) -eq $target } | Select-Object -First 1
+    if (-not $m) { return $null }
+    $val = [pscustomobject]@{ Id = "$($m.Id)"; Name = $m.Name }
+    $Entry | Add-Member -NotePropertyName 'automate' -NotePropertyValue $val -Force
+    $script:ServiceMapDirty = $true
+    return $val.Id
+}
+
+function Get-ConfigCountPill {
+    # A pill card-item "<Label>: <count>". Links to the client's ConnectWise Automate computers page
+    # when -Link is supplied (Automate icon via -Brand); otherwise to the IT Glue configs list
+    # filtered by type. (Future: append a stale count, e.g. devices not seen in Automate for 90+ days.)
+    param([string]$Label, [string]$TypeName, [string]$OrgId, [string]$LinkBase, [string]$TypeId,
+          [string]$StatusId, [string]$Link = '', [string]$Brand = '')
+    if (-not $TypeId -or -not $StatusId) { return New-CardItem -Label "${Label}: n/a" }
     $count = $null
     try {
         $count = [int](Get-ITGlueConfigurations -filter_organization_id $OrgId -filter_configuration_type_id $TypeId `
             -filter_configuration_status_id $StatusId -page_size 1).meta.'total-count'
-    } catch { Write-Status "  IT Glue $Title query failed: $($_.Exception.Message)" Warning }
-    $shading = if ($count -gt 0) { 'success' } else { 'danger' }
-    # IT Glue UI filter deep-link (matches the app's #partial=...&filters=[Type:<name>] hash format).
-    $typeEnc = [Uri]::EscapeDataString($TypeName)
-    $link = "$LinkBase/configurations#partial=&sortBy=name:asc&filters=%5BType:$typeEnc%5D"
-    return New-Tile -Title $Title -Shading $shading -Content "$([int]$count)" -Detail 'Active' -Link $link
+    } catch { Write-Status "  IT Glue $Label query failed: $($_.Exception.Message)" Warning }
+    if (-not $Link) {
+        # Fallback: IT Glue UI filter deep-link (#partial=...&filters=[Type:<name>]).
+        $link = "$LinkBase/configurations#partial=&sortBy=name:asc&filters=%5BType:$([Uri]::EscapeDataString($TypeName))%5D"
+    } else { $link = $Link }
+    return New-CardItem -Label "${Label}: $([int]$count)" -Link $link -Brand $Brand -Muted
+}
+
+function Get-DashDevices {
+    # 'Devices' card: Workstations + Servers pills (active IT Glue configs). Pills link to the client's
+    # ConnectWise Automate computers page when the org matches an Automate client; else to IT Glue.
+    param([pscustomobject]$Entry, [string]$OrgId, [string]$OrgName, [string]$LinkBase, [string]$WsTypeId, [string]$SvTypeId, [string]$StatusId)
+    $autoLink = ''; $brand = ''
+    $autoId = Resolve-AutomateClient -Entry $Entry -OrgName $OrgName
+    if ($autoId) { $autoLink = "$($script:AutomateUrl)/automate/browse/companies/computers?companyId=$autoId"; $brand = 'automate' }
+    $items = @(
+        (Get-ConfigCountPill -Label 'Workstations' -TypeName 'Managed Workstation' -OrgId $OrgId -LinkBase $LinkBase -TypeId $WsTypeId -StatusId $StatusId -Link $autoLink -Brand $brand),
+        (Get-ConfigCountPill -Label 'Servers'      -TypeName 'Managed Server'      -OrgId $OrgId -LinkBase $LinkBase -TypeId $SvTypeId -StatusId $StatusId -Link $autoLink -Brand $brand)
+    )
+    return New-Card -Title 'Devices' -Items $items
 }
 
 # ==============================================================================
 # Rendering
 # ==============================================================================
-function ConvertTo-PanelHtml {
-    param([pscustomobject]$Tile, [int]$Size = 3)
-    $title = $Tile.Title
-    if ($Tile.Link) { $title = "<a href=`"$($Tile.Link)`">$title</a>" }
+$script:CardColor = '#051554'   # navy card background
 
-    if ($Tile.IsInfo) {
-        $content = if ($Tile.InfoItems.Count -gt 0) { ,$Tile.InfoItems } else { @([pscustomobject]@{ Shading='warning'; AlertText='None' }) }
-        return New-BootstrapInfoPanel -PanelShading $Tile.Shading -PanelTitle $title -PanelContent $content -PanelSize $Size
+function ConvertTo-CardItemHtml {
+    param([pscustomobject]$Item)
+    $brand = Resolve-Brand $Item.Brand
+    if ($Item.Bg) {
+        # Explicit colour override (e.g. red alert) wins over brand/muted.
+        $colored = $true; $bg = $Item.Bg; $border = 'none'
+    } else {
+        $colored = ($brand -and $brand.Color -and -not $Item.Muted)
+        $bg      = if ($colored) { $brand.Color } else { 'rgba(255,255,255,0.12)' }
+        $border  = if ($colored) { 'none' } else { '1px solid rgba(255,255,255,0.2)' }
     }
-    return New-BootstrapSinglePanel -PanelShading $Tile.Shading -PanelTitle $title `
-        -PanelContent $Tile.Content -ContentAsBadge -PanelAdditionalDetail $Tile.Detail -PanelSize $Size
+
+    if ($Item.Kind -eq 'number') {
+        $inner = "<span style=`"font-size:30px;font-weight:800;line-height:1;`">$(Get-HtmlEncoded $Item.Label)</span>" +
+                 "<span style=`"font-size:13px;font-weight:600;opacity:0.85;margin-top:4px;`">$(Get-HtmlEncoded $Item.Sub)</span>"
+        $style = "display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;" +
+                 "padding:16px 14px;border-radius:10px;text-decoration:none;word-break:break-word;background:$bg;color:#fff;border:$border;"
+    }
+    else {
+        $icon = ''
+        if ($brand -and $brand.Logo) {
+            $icon = "<span style=`"display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:7px;background:#fff;flex:none;`">" +
+                    "<img src=`"$($brand.Logo)`" alt=`"`" width=`"18`" height=`"18`" style=`"display:block;width:18px;height:18px;object-fit:contain;`"></span>"
+        }
+        $weight = if ($colored) { '700' } else { '600' }
+        $inner  = "$icon<span>$(Get-HtmlEncoded $Item.Label)</span>"
+        $style  = "display:flex;align-items:center;justify-content:center;gap:10px;text-align:center;" +
+                  "padding:12px 14px;border-radius:10px;font-size:14px;font-weight:$weight;line-height:1.3;" +
+                  "text-decoration:none;word-break:break-word;background:$bg;color:#fff;border:$border;"
+    }
+
+    if ($Item.Link) { return "<a href=`"$($Item.Link)`" target=`"_blank`" rel=`"noopener`" style=`"$style`">$inner</a>" }
+    return "<div style=`"$style`">$inner</div>"
+}
+
+function ConvertTo-CardHtml {
+    param([pscustomobject]$Card)
+    $items = @($Card.Items)
+    if ($items.Count -eq 0) { $items = @(New-CardItem -Label 'None') }   # empty category -> muted 'None'
+    $body = ($items | ForEach-Object { ConvertTo-CardItemHtml $_ }) -join ''
+    $h3 = "<h3 style=`"margin:0;color:#fff;font-size:13px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;text-align:center;opacity:0.82;`">$(Get-HtmlEncoded $Card.Title)</h3>"
+    $inner = "<div style=`"flex:1;display:flex;flex-direction:column;justify-content:center;gap:10px;`">$body</div>"
+    return "<div style=`"background:$($script:CardColor);border-radius:16px;padding:22px 20px;display:flex;flex-direction:column;gap:14px;aspect-ratio:1 / 1;box-shadow:0 2px 6px rgba(5,21,84,0.12);`">$h3$inner</div>"
 }
 
 function New-DashboardHtml {
-    # Inner panels markup only - this is the exact string a future -Publish would store in IT Glue.
-    # Singles render at col-sm-3 (wrap to multiple rows); Infos (lists) render at col-sm-6.
-    param([pscustomobject[]]$Singles, [pscustomobject[]]$Infos)
-    $s = ($Singles | ForEach-Object { ConvertTo-PanelHtml -Tile $_ -Size 3 }) -join ''
-    $i = ($Infos   | ForEach-Object { ConvertTo-PanelHtml -Tile $_ -Size 6 }) -join ''
-    return "<div class=`"row`">$s</div><div class=`"row`">$i</div>"
+    # Responsive card grid - this is the exact markup a future -Publish would store in IT Glue
+    # (all card styling is inline, which IT Glue preserves; only the page chrome uses <style>).
+    param([pscustomobject[]]$Cards)
+    $cards = ($Cards | ForEach-Object { ConvertTo-CardHtml -Card $_ }) -join ''
+    return "<div style=`"display:grid;grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:18px;`">$cards</div>"
 }
 
 function New-PreviewDocument {
-    # Wrap the dashboard markup in a Bootstrap-3 CDN page for local browser preview only.
+    # Local browser preview only: light page chrome + header around the card grid.
     param([string]$DashboardHtml, [string]$OrgName)
+    $enc = [System.Net.WebUtility]::HtmlEncode($OrgName)
+    $gen = Get-Date -Format 'yyyy-MM-dd HH:mm'
     @"
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>$([System.Net.WebUtility]::HtmlEncode($OrgName)) - PeopleFirst Services</title>
-<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css">
-<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap-theme.min.css">
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$enc - PeopleFirst Services</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { background: #eef0f5; font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; color: #1c2333; -webkit-font-smoothing: antialiased; }
+</style>
 </head>
 <body>
-<div class="container-fluid" style="margin-top:20px">
-<h1>$([System.Net.WebUtility]::HtmlEncode($OrgName)) - PeopleFirst Services</h1>
-<p class="text-muted">Local preview - generated $(Get-Date -Format 'yyyy-MM-dd HH:mm')</p>
+<div style="max-width: 1180px; margin: 0 auto; padding: 36px 28px 56px;">
+  <header style="margin-bottom: 28px;">
+    <h1 style="margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -0.01em; color: #051554;">$enc</h1>
+    <p style="margin: 6px 0 0; font-size: 15px; font-weight: 600; color: #5b6478;">PeopleFirst Services Overview</p>
+    <p style="margin: 4px 0 0; font-size: 12px; color: #97a0b5;">Local preview &middot; generated $gen</p>
+  </header>
 $DashboardHtml
 </div>
-</body>
-</html>
+</body></html>
 "@
 }
 
@@ -1048,9 +1269,6 @@ if (-not (Get-Module -ListAvailable -Name ITGlueAPI)) {
     Install-Module -Name ITGlueAPI -Scope CurrentUser -Force -AllowClobber
 }
 Import-Module ITGlueAPI -Force
-
-# Bootstrap helpers
-. (Join-Path $ScriptDir 'lib\ITGlue-BootStrapHelpers.ps1')
 
 # Credentials
 $creds = Initialize-Credentials -Reset:$Reset
@@ -1075,6 +1293,36 @@ if ($creds.CWM.Configured) {
     } catch { Write-Status "ConnectWise Manage connect failed: $($_.Exception.Message)" Warning }
 }
 
+# CIPP (M365 data) - one client-credentials token, reused for every client. Per-org tenant lookup
+# is done in Resolve-CippTenant via ListTenants?TenantFilter=<domain>.
+$script:CippConnected = $false
+if ($creds.CIPP.Configured) {
+    try {
+        $tok = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$($creds.CIPP.TenantId)/oauth2/v2.0/token" -Method Post `
+            -ContentType 'application/x-www-form-urlencoded' -Body @{
+                client_id = $creds.CIPP.ClientId; client_secret = $creds.CIPP.ClientSecret
+                grant_type = 'client_credentials'; scope = $creds.CIPP.Scope
+            }
+        $script:CippToken   = $tok.access_token
+        $script:CippApiUrl  = $creds.CIPP.ApiUrl.TrimEnd('/')
+        $script:CippConnected = $true
+    } catch { Write-Status "CIPP connect failed: $($_.Exception.Message)" Warning }
+}
+
+# ConnectWise Automate - token + client list (used to link the Devices pills to the client's
+# computers). The ClientId header is required on every Automate API call.
+$script:AutomateConnected = $false
+if ($creds.Automate.Configured) {
+    try {
+        $script:AutomateUrl = $creds.Automate.Url.TrimEnd('/')
+        $aTok = (Invoke-RestMethod -Uri "$script:AutomateUrl/cwa/api/v1/apitoken" -Method Post `
+            -Headers @{ ClientId = $creds.Automate.ClientId } -ContentType 'application/json' `
+            -Body (@{ UserName = $creds.Automate.Username; Password = $creds.Automate.Password } | ConvertTo-Json)).AccessToken
+        $script:AutomateHeaders = @{ Authorization = "Bearer $aTok"; ClientId = $creds.Automate.ClientId }
+        $script:AutomateConnected = $true
+    } catch { Write-Status "Automate connect failed: $($_.Exception.Message)" Warning }
+}
+
 # Resolve organization
 if ([string]::IsNullOrWhiteSpace($Organization)) { $Organization = Read-Host "IT Glue organization name or ID" }
 
@@ -1097,20 +1345,18 @@ $entry = Get-OrgMapEntry -Map $script:ServiceMap -OrgId $orgId -OrgName $orgName
 
 # -- Gather tiles --
 Write-Status "`nGathering service data..." Info
-$hasM365 = $false
 
 # Resolve IT Glue configuration type/status ids once (by name) for the Workstation/Server tiles.
 $wsTypeId       = Get-ItgConfigTypeId   -Name 'Managed Workstation'
 $svTypeId       = Get-ItgConfigTypeId   -Name 'Managed Server'
 $activeStatusId = Get-ItgConfigStatusId -Name 'Active'
 
-$tileUsers  = Get-DashUsers     -Entry $entry -OrgId $orgId -OrgName $orgName -LinkBase $linkBase -Creds $creds
-$tileWs     = Get-DashConfigTile -Title 'Workstations' -OrgId $orgId -LinkBase $linkBase -TypeId $wsTypeId -TypeName 'Managed Workstation' -StatusId $activeStatusId
-$tileSv     = Get-DashConfigTile -Title 'Servers'      -OrgId $orgId -LinkBase $linkBase -TypeId $svTypeId -TypeName 'Managed Server'      -StatusId $activeStatusId
-$tileAv     = Get-DashAntivirus -Entry $entry -OrgName $orgName -Creds $creds
+$tileUsers   = Get-DashUsers   -Entry $entry -OrgId $orgId -OrgName $orgName -LinkBase $linkBase -Creds $creds
+$tileDevices = Get-DashDevices -Entry $entry -OrgId $orgId -OrgName $orgName -LinkBase $linkBase -WsTypeId $wsTypeId -SvTypeId $svTypeId -StatusId $activeStatusId
+$tileAv      = Get-DashAntivirus -Entry $entry -OrgName $orgName -Creds $creds
 $tileMfa    = Get-DashMfa       -Entry $entry -OrgName $orgName -Creds $creds
 $tileBackup = Get-DashBackup    -Entry $entry -OrgName $orgName -Creds $creds
-$tileM365   = Get-DashM365      -OrgId $orgId -LinkBase $linkBase -HasM365Out ([ref]$hasM365)
+$tileM365   = Get-DashM365      -Entry $entry -OrgId $orgId -LinkBase $linkBase
 $tileDomains = Get-DashDomains  -OrgId $orgId -LinkBase $linkBase
 
 # Persist any new resolutions
@@ -1121,9 +1367,8 @@ if ($script:ServiceMapDirty) {
 }
 
 # -- Render --
-$singles = @($tileUsers, $tileWs, $tileSv, $tileAv, $tileMfa, $tileBackup)
-$infos   = @($tileM365, $tileDomains)
-$dashboardHtml = New-DashboardHtml -Singles $singles -Infos $infos
+$cards = @($tileUsers, $tileDevices, $tileAv, $tileMfa, $tileBackup, $tileM365, $tileDomains)
+$dashboardHtml = New-DashboardHtml -Cards $cards
 
 # Output
 if ([string]::IsNullOrWhiteSpace($OutFile)) {

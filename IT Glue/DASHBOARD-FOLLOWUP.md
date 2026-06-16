@@ -77,6 +77,89 @@ same HTML into an IT Glue flexible asset (see "Go-live" below).
 - Singles row order: Users, Workstations, Servers, Antivirus, MFA, Backup. Info row: M365 Licenses,
   Domains.
 
+## Redesign 2026-06-15 (round 3) - new card UI (from Claude design mockup)
+- Replaced the Bootstrap-3 panel rendering with a custom inline-styled **card grid** (matches the
+  user's Claude-design mockup). All card CSS is INLINE (IT Glue go-live keeps inline styles); only
+  the local-preview page chrome (body bg `#eef0f5`, font) uses a `<style>` block.
+- Data model: tiles now return `New-Card -Title -Items`, where each item is `New-CardItem` with
+  `Label, Sub, Link, Bg, IconDomain, Kind` (Kind 'pill' or 'number'). Renderers: ConvertTo-CardItemHtml,
+  ConvertTo-CardHtml, New-DashboardHtml (single responsive grid), New-PreviewDocument.
+- Cards are navy `#051554` (var `$script:CardColor`), `aspect-ratio:1/1`, grid
+  `repeat(auto-fit, minmax(220px,1fr))`. Brand pills use Google favicon service
+  `https://www.google.com/s2/favicons?domain=<d>&sz=64`. Brand colors: IT Glue #00A2B3,
+  ConnectWise #54BEED, SentinelOne #6B0AEA, Bitdefender #ED1C24, Duo #6BBE4A, Veeam #00B336,
+  Cove(endpoint) #0E9BA6; muted items (Cove 365, M365 licenses, Domains, Workstation/Server number
+  cards) use rgba(255,255,255,0.12). Empty category renders a muted 'None' pill.
+- `lib/ITGlue-BootStrapHelpers.ps1` is NO LONGER USED (dot-source removed). Left in repo for now;
+  safe to delete. The .SYNOPSIS still says "gavsto Bootstrap-panel" - cosmetic, not updated.
+- Favicons load from google.com (fine for preview; for IT Glue go-live confirm external <img> is
+  allowed or swap to inline/data-URI icons).
+
+## Round 4 2026-06-15 - Devices, Brandfetch, Users/agreement
+- **Devices card**: merged Workstations + Servers into one 'Devices' card with a Workstations pill +
+  a Servers pill (Get-DashDevices / Get-ConfigCountPill). Card order now: Users, Devices, Antivirus,
+  MFA, Backup, M365 Licenses, Domains. FUTURE: add a stale count per type (devices not seen in
+  ConnectWise Automate for 90+ days) - needs Automate API/DB (separate integration).
+- **Brand styling via Brandfetch**: New-CardItem now takes `-Brand <domain>` (+ `-Muted`) instead of
+  -Bg/-IconDomain. `$script:BrandMap` bakes accent color + logo URL per brand (from Brandfetch);
+  `Resolve-Brand` returns baked entry or live-fetches+caches unmapped domains. **API key is hard-coded**
+  in `$script:BrandfetchApiKey` (per user request) - SECURITY: visible in repo; restrict in Brandfetch
+  (domain allowlist) or rotate. Logos load from cdn.brandfetch.io (replaced Google favicons). Colors:
+  itglue #3860be, connectwise #5ea4de, sentinelone #6b0aea, bitdefender #EB0000, duo #74bf4b,
+  veeam #03D15F, n-able/Cove #c046ff, microsoft #00A4EF. CAVEAT: logos are Brandfetch icon/symbol
+  assets (mostly theme=dark) on a WHITE square - not visually verified; if any render white-on-white,
+  switch that brand to a light-theme asset or favicon.
+- **Users card restructure**: ConnectWise now ABOVE IT Glue, with TWO CW pills: "CWM Contacts: <n>"
+  (active contacts, links to billing contact) and "CWM Agreement: <qty>" = quantity of part
+  **CBT-PF-MEMBER** on the company's agreement name 'IT Services Agreement - PeopleFirst Support',
+  type 'IT Services Agreement' (Get-CwmMemberQty). Skipped entirely if the company has no such
+  agreement (Christine = skipped; Beaty & Brown = 6). Agreement TYPE field is `type.name` in CWM.
+
+## Pending: M365 card (blocked on CIPP API)
+User wants an 'M365' card = move the M365 Licenses list into it + add **MFA status** + **AD/Entra
+sync** pills, pulled via the **CIPP API** (CIPP + GDAP to all clients - see [[m365-via-cipp]]).
+CIPP instance: https://m365.codebluetechnology.com. API client app id 70ac3930-842e-4e4c-a1e7-f40ec5b81076.
+BLOCKED: CIPP "Save Azure Configuration" failed ("Failed to save allowed API clients to Azure...") -
+the CIPP function app lacks rights to edit its Authentication settings; the API client isn't yet an
+allowed client so token auth will fail. Resolve that (CIPP managed identity needs Contributor on the
+function app / resource group, OR manually add the client app id under Function App > Authentication >
+allowed client applications), then build. Token: POST login.microsoftonline.com/<partnerTenantId>/oauth2/v2.0/token,
+grant_type=client_credentials, scope=api://<appid>/.default (ensure that app's Application ID URI is set under Expose an API).
+
+## M365 card 2026-06-16 - DONE (via CIPP)
+- Renamed M365 Licenses card -> "M365": MFA pill + AD-sync pill on top, then the license list.
+- CIPP creds in dashboard-credentials.xml ($creds.CIPP: ApiUrl https://cippz2zp4.azurewebsites.net,
+  TenantId, ClientId, ClientSecret, Scope api://<clientid>/.default). Token = client_credentials.
+- MFA: ListGraphRequest Endpoint=reports/authenticationMethods/userRegistrationDetails -> "MFA:
+  <isMfaRegistered>/<total>". AD sync: Endpoint=organization -> onPremisesSyncEnabled +
+  onPremisesLastSyncDateTime -> "AD Sync: Synced (Nh ago)" or "Cloud-only".
+- TENANT MATCH: by DOMAIN. **GOTCHA**: bare /api/ListTenants intermittently returns a single
+  AGGREGATED row (all 152 domains joined by spaces in one object) instead of 152 rows - this poisoned
+  the match. FIX: query **/api/ListTenants?TenantFilter=<domain>** per org IT Glue domain (returns a
+  clean single tenant; the tenant's DEFAULT domain is the one that works - secondary domains 400 in
+  Graph with "not under scope"). Misses are NOT cached (re-resolve next run) to avoid poisoning.
+- Verified: Christine -> MFA 30/94, AD Sync Synced. CIPP client secret was pasted in chat -> ROTATE.
+
+## Automate links on Devices card 2026-06-16 - DONE (icon pending)
+- Devices Workstations/Servers pills now link to the client's Automate computers page:
+  `<AutomateUrl>/automate/browse/companies/computers?companyId=<id>`. Falls back to the IT Glue
+  configs deep-link if the org has no Automate match.
+- Automate creds in dashboard-credentials.xml ($creds.Automate: Url https://automate.codebluetechnology.com,
+  Username **ITGlue** (NOT Itglueadmin - that user has local login disabled), Password, ClientId
+  b25df2bd-...). AUTH: POST /cwa/api/v1/apitoken {UserName,Password} with **ClientId header** ->
+  AccessToken; then Bearer + **ClientId header on every call** (data calls 401 without ClientId; the
+  token POST tolerates its absence). Server is ConnectWise-SSO-bound (IsLocalLoginEnabled=false), so
+  the API user must be local-login capable (ITGlue is; Itglueadmin wasn't).
+- TENANT/CLIENT MATCH: query `/cwa/api/v1/clients?condition=Name contains '<token>'` then
+  normalized-match (Resolve-AutomateClient). The bulk clients?pagesize=N list has the SAME aggregation
+  flakiness as CIPP ListTenants (intermittent single merged row) - so we use the filtered query and
+  do NOT cache misses. Verified: Christine -> companyId 131, Beaty & Brown -> 8.
+- ICON: DONE. No Brandfetch entry / favicon 404s, so BrandMap['automate'].Logo is an inlined
+  base64 PNG data URI (downscaled to 64x64 from the supplied IT Glue/automate.png). Source PNG can be
+  deleted; the data URI is self-contained in the script.
+- Type filter: the computers URL has no device-type param, so both pills link to the full computers
+  list (the pill label still shows the workstation/server counts).
+
 ## Open items / next steps
 0. **VEEAM: FIXED + verified 2026-06-15** (Dominion Leasing Software -> "3 Protected, 3 VMs").
    Confirmed live on veeam.codebluetechnology.com:1280:
