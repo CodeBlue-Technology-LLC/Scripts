@@ -19,6 +19,30 @@ same HTML into an IT Glue flexible asset (see "Go-live" below).
 - `IT Glue/Output/*.html` - generated dashboards, git-ignored (Output added to .gitignore).
 - Real path on this box is `c:\cbt\Scripts\github\Scripts\IT Glue` (not `...\Scripts\Scripts\...`).
 
+## SonicWall + WatchGuard firewalls/endpoint (added 2026-06-18)
+- **SonicWall via MySonicWall API** (`X-api-key`, base `https://api.mysonicwall.com`). The provided key
+  is a billing/partner key: ONLY `get-cloud-tenants`, `get-firewalls`, and `product/serviceInfo` work
+  (every other product/license endpoint 401s; the CSC access-code/token flow fails `INVALID CLIENTID`).
+  - `get-cloud-tenants` → `content.arrTenants` (193 tenants). Per tenant `cloudServices.avaiableRatio`
+    gives the **Capture Client** active-endpoint count and **CAS2.0** protected-user count (single
+    numbers — no total-licenses denominator available). Drives the Devices + Email pills.
+  - `get-firewalls?productGroupId=<grp>&userName=<acct>` → the whole registered fleet (~196). Hardware
+    firewalls are all registered under **our own product group (CodeBlue Technology Products, 1254091)**;
+    join firewall→client by **friendlyName** (auto-detected as the group with the most products). Gives
+    model + `firmwareVersion` + `licenseExpired`. `serviceInfo?serial=` gives per-service expiry dates.
+- **WatchGuard Cloud** (OAuth + `WatchGuard-API-Key`, USA region, account `ACC-1326807`). `assets/
+  summary/firebox` gives model + `licenseExpiryDate` + `daysUntilExpiry`, joined by friendlyName. Live
+  online/offline + firmware are NOT exposed (the `platform/devices/v1` routes 404 for these creds).
+- **Out of scope (no data source w/ current access):** live online/offline (needs NSM, which we don't
+  have, or WG monitoring scope) and firmware-"upgrade-available" comparison.
+- **Network card now sources firewalls from these APIs, not IT Glue** (`Get-ItgConfigs` firewall path
+  removed). Firewalls match by friendlyName via the UniFi-style pick-list, cached under
+  `entry.sonicwallFw` / `entry.watchguard`; CC/CAS tenant cached under `entry.sonicwall`.
+- **TODO / rotate:** the MySonicWall key and WatchGuard read-only creds were shared in chat / were
+  hard-coded in `Temp/Compare-WatchGuardToCWM.ps1` — rotate after this lands; they now live only in
+  `dashboard-credentials.xml`. Verified live 2026-06-18 against Christine Rausch (CC 67, CAS 68, 2 WG
+  Fireboxes, no SonicWall hardware).
+
 ## Current status (as of 2026-06-15)
 - Both scripts parse clean (PS 5.1), pure ASCII. Read-only verified (no ITGlue writes; only auth +
   JSON-RPC read POSTs to vendors).
@@ -159,6 +183,84 @@ grant_type=client_credentials, scope=api://<appid>/.default (ensure that app's A
   deleted; the data URI is self-contained in the script.
 - Type filter: the computers URL has no device-type param, so both pills link to the full computers
   list (the pill label still shows the workstation/server counts).
+
+## Network card 2026-06-17 - DONE (verified vs Christine Rausch)
+New **Network** card (row 2, after Devices) with three sub-boxes:
+- **SonicWall** / **WatchGuard**: active IT Glue configs of type **"Managed Network Firewall"**
+  (`Get-ItgConfigs` paged full-object fetch + `$fwTypeId`), split by `attributes.'manufacturer-name'`
+  via case-insensitive `-match` (catches "SonicWALL", "SonicWall Inc.", "WatchGuard"). One pill per
+  firewall, linking to its IT Glue config page `<linkBase>/configurations/<id>`. (User chose IT Glue
+  link over external-IP link.)
+- **UniFi**: **Site Manager cloud API** (`https://api.ui.com`, header `X-API-KEY`; creds in
+  dashboard-credentials.xml `$creds.UniFi.ApiKey`). `Get-UnifiSites` pages `/v1/hosts` + `/v1/sites`
+  via `nextToken`. **IMPORTANT field mapping**: the client name is `site.meta.desc` (e.g. "Christine
+  S. Rausch, MD, PC - Shrader"); `site.meta.name` is an internal slug ("default"/"haeumwvi") used as
+  the URL site segment; this MSP runs MULTIPLE clients as separate sites on shared consoles, so match
+  on desc, falling back to the console's `reportedState.name` when desc is blank/"Default".
+- **MATCHING**: names are unreliable (length-capped, "- <site>" suffixes, can't always rename), so
+  UniFi uses a dedicated `Resolve-UnifiSites`: fuzzy-ranked pick-list (strip trailing "- suffix",
+  normalize, score exact/prefix + token overlap), **multi-select** (one pill per chosen site), cached
+  by stable **siteId** under `$entry.unifi`, rehydrated against the live list each run. `-Remap`
+  re-prompts (e.g. client adds a site). Verified: "Christine S. Rausch, MD, PC" auto-ranks
+  "...- Shrader" #1 (score 1005); 182 sites enumerated.
+- **CONSOLE LINK**: `https://unifi.ui.com/<seg>/<hostId>/network/<slug>/dashboard` where `<seg>` is
+  **`consoles`** for UniFi-OS console hosts and **`network-servers`** for self-hosted Network servers.
+  The segment is driven by the host's **`type`** field (`console` vs `network-server`) from /v1/hosts -
+  NOT the id format (both types appear as GUIDs and as `MAC...:ts` strings). `hostId` is used verbatim.
+  Cache stores siteId+slug+hostId+PathSeg. Verified live: Christine's host "CBC Unifi" is a
+  network-server -> `.../network-servers/d0afbc8c-.../network/d074hu6s/dashboard` (user-confirmed).
+  Host mix in this account: 87 console, 14 network-server.
+- **Brand icons** (Brandfetch, baked in `$script:IconMap`): sonicwall.com #0078E0, watchguard.com
+  #ED1C24, ui.com #2282FF. NOTE SonicWall's Brandfetch accent is BLUE (#0078E0), close to UniFi blue
+  (#2282FF) - the sub-box labels + logos disambiguate; switch SonicWall to orange if it reads ambiguous.
+- **SECURITY**: UniFi Site Manager key was pasted in chat - **ROTATE** at unifi.ui.com after setup.
+
+## Sub-box restyle + vendor banding 2026-06-17 - DONE (verified vs Christine Rausch)
+Brand colour moved OFF the pills (bright fills read poorly, esp. WatchGuard red) and onto a header
+strip; every card is now composed of vendor bands.
+- **ConvertTo-CardGroupHtml**: sub-box is now a coloured **top strip (brand name only, no logo)** over
+  a neutral pill body (container `overflow:hidden`; strip `background:<brandColor>;padding:8px 12px`).
+  Inner pills inherit the group's Brand so each shows the brand **logo on its left**.
+- **ConvertTo-CardItemHtml**: pills are ALWAYS neutral now (`rgba(255,255,255,0.12)` + faint border);
+  removed the brand-colour fill / `$colored` weight logic (weight fixed 600). Explicit `-Bg` still
+  wins; `-Alert`/`-Ring` outlines unchanged.
+- **Auto-banding (option A)**: new `Group-CardItems` wraps runs of ADJACENT same-brand top-level pills
+  into a `New-CardGroup` band, applied in `ConvertTo-CardHtml` to every card. Band label comes from
+  `$script:BrandName` (brand key -> display name, e.g. automate->'ConnectWise Automate',
+  winserver->'Domain Controllers'); pills whose brand isn't in that map render bare. Existing groups
+  and 'number' pills pass through; order preserved (only adjacent pills merge).
+- **Domains**: domains on OUR Cloudflare portal ($script:CloudflarePortal) cluster under a **Cloudflare
+  band** at the top; the rest render flat (heterogeneous DNS hosts). Card is `-NoBand` so the flat
+  remainder isn't auto-grouped by DNS-host brand. Domains with no resolvable DNS-host brand fall back
+  to the **itglue.com** icon so every flat pill has an icon (fixes iconless adov.net).
+- **'Microsoft 365' card renamed 'Email'** (Get-DashM365 both return paths).
+- **Grid widened**: `minmax(220px,1fr)` -> `minmax(260px,1fr)` in New-DashboardHtml.
+- Mockups (git-ignored Output/): network-mockup.html, network-mockup-icons.html,
+  dashboard-banded-mockup.html - safe to delete.
+
+## Microsoft 365 / Intune devices on Devices card 2026-06-17 - DONE (verified vs Christine Rausch)
+Devices card now has a **Microsoft 365 band** (auto-banded via brand microsoft.com) alongside the
+ConnectWise Automate band. `Get-CippDeviceItems -TenantFilter` (CIPP/Graph), all **active in last 90d**:
+- **Intune** (`deviceManagement/managedDevices`), deduped by **azureADDeviceId**, split **Computers**
+  (Windows/macOS) vs **Mobile** (iOS/iPadOS/Android). Intune's own `joinType` is unreliable (returns
+  'unknown'), so it's NOT used; filter on `lastSyncDateTime`.
+- **Entra join type** (`devices.trustType`, each device has exactly one -> no double count, filter on
+  `approximateLastSignInDateTime`): AzureAd->Azure AD Joined, ServerAd->Hybrid Joined,
+  Workplace->Registered. **Empty trustType is skipped** (mostly MDM-only mobile, already counted under
+  Intune Mobile -> avoids double counting the iPads). Zero-count buckets hidden.
+- DOUBLE-COUNT NOTE: Intune (management) and Entra join type (identity) are deliberately separate
+  lenses and CAN overlap for a device that's both Intune-managed and AAD/Hybrid joined (user accepted).
+- Wired: `Get-DashDevices` takes `-CippTenant $cippTenant` (passed in MAIN). Verified Christine:
+  Automate band (Workstations 77, Servers 2) + Microsoft 365 band (Intune Mobile 56, Registered 38).
+  Christine has 0 Intune Computers / 0 AAD-joined / 0 Hybrid (hidden); 57 untyped iPads excluded.
+
+## Users merged into Identity 2026-06-17 - DONE (verified vs Christine Rausch)
+The standalone **Users** card was folded into **Identity** (kept that name). In MAIN, `Get-DashUsers`
+and `Get-DashIdentity` are still called separately, then their `.Items` are concatenated (users first)
+into one `New-Card -Title 'Identity'`; `$tileUsers` removed from `$cards` (now 7 cards). Pill order:
+ConnectWise (PeopleFirst agreement if present, then contacts) -> IT Glue contacts -> Duo -> Microsoft
+365 (MFA, AD sync) -> Domain Controllers. Auto-banding turns each vendor run into its own band.
+Verified Christine: bands ConnectWise | IT Glue | Duo | Microsoft 365 | Domain Controllers.
 
 ## Open items / next steps
 0. **VEEAM: FIXED + verified 2026-06-15** (Dominion Leasing Software -> "3 Protected, 3 VMs").
