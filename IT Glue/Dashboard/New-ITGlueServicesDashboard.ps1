@@ -14,7 +14,8 @@
                         locked-out/not-enrolled/stale breakdown with the at-risk usernames.
       - Backup        : Veeam (VSPC REST API) if present, else Cove; TB + device/VM counts.
       - M365 Backup   : Cove M365 backup (only if the org has M365), else "None".
-      - Domains       : list of IT Glue domains, each linking to its IT Glue domain page.
+      - Deliverability: per mail-enabled M365 domain, a pill (DNS-host icon) expanding to its live
+                        SPF/DKIM/DMARC posture; green ring when healthy, red outline when records lapse.
       - M365 Licenses : read from IT Glue's native "Microsoft Licenses" flexible asset.
 
     CLIENT MATCHING IS AUTOMATIC. Each vendor is resolved against the org by normalized name.
@@ -569,13 +570,13 @@ function Get-DuoUserCounts {
     # all from the same response (no extra calls). Duo statuses: 'active', 'bypass', 'disabled',
     # 'locked out' (note the SPACE - not an underscore). We report active/bypass/disabled/locked-out
     # counts, plus 'not enrolled' (an active user with no 2FA device) and 'stale' (active, no login in
-    # 90+ days), and collect bypass + not-enrolled names for the expandable pill's panel.
+    # 90+ days), and collect bypass / disabled / locked-out / not-enrolled names for the pill's panel.
     # -ApiHost overrides the parent MSP host with the child account's own api_hostname when known;
     # a child on a different Duo deployment 400s if queried against the parent host.
     param([hashtable]$Creds, [string]$AccountId, [string]$ApiHost)
     $duoHost = if ($ApiHost) { $ApiHost } else { $Creds.Duo.ApiHost }
     $active = 0; $bypass = 0; $disabled = 0; $lockedOut = 0; $notEnrolled = 0; $stale = 0; $offset = 0
-    $bypassNames = @(); $notEnrolledNames = @()
+    $bypassNames = @(); $notEnrolledNames = @(); $disabledNames = @(); $lockedOutNames = @()
     # Stale threshold: last_login is epoch SECONDS (may be null). Compute the cutoff once.
     $staleBefore = [DateTimeOffset]::UtcNow.AddDays(-90).ToUnixTimeSeconds()
     # username -> realname -> email fallback so a listed name is never blank.
@@ -587,8 +588,8 @@ function Get-DuoUserCounts {
             switch ("$($u.status)") {
                 'active'     { $active++ }
                 'bypass'     { $bypass++;    $n = & $nameOf $u; if ($n) { $bypassNames += $n } }
-                'disabled'   { $disabled++ }
-                'locked out' { $lockedOut++ }
+                'disabled'   { $disabled++;  $n = & $nameOf $u; if ($n) { $disabledNames += $n } }
+                'locked out' { $lockedOut++; $n = & $nameOf $u; if ($n) { $lockedOutNames += $n } }
             }
             # Gaps are scoped to active accounts only: a disabled/locked-out user can't sign in, so a
             # missing 2FA device or stale login isn't a live risk for them.
@@ -605,6 +606,7 @@ function Get-DuoUserCounts {
         Active = $active; Bypass = $bypass; Disabled = $disabled; LockedOut = $lockedOut
         NotEnrolled = $notEnrolled; Stale = $stale
         BypassNames = @($bypassNames | Sort-Object -Unique); NotEnrolledNames = @($notEnrolledNames | Sort-Object -Unique)
+        DisabledNames = @($disabledNames | Sort-Object -Unique); LockedOutNames = @($lockedOutNames | Sort-Object -Unique)
     }
 }
 
@@ -792,16 +794,17 @@ function Get-VspcCompanyBackup {
     # Per-protected-entity backup detail for the company. The ?filter= param breaks the computers
     # endpoints (they fall through to the SPA), so we page each list and filter client-side by
     # organizationUid. Returns one object per entity: Name, Type (Server/Workstation/VM), LatestBackupUtc
-    # (last successful backup), TotalSizeBytes, and BackupType. We cover all three workload sources:
+    # (last successful backup), TotalSizeBytes, and Destination. We cover all three workload sources:
     #   virtualMachines              -> VM backups (size via totalRestorePointSize)
     #   computersManagedByConsole    -> agents managed by our cloud console (Cloud Connect)
     #   computersManagedByBackupServer -> agents managed by a B&R server (role: Client/Hosted/CloudConnect)
-    # BackupType combines the workload with where it's managed, via the managing server's role:
-    #   Client -> 'Local B&R', Hosted -> 'Hosted', CloudConnect -> 'Cloud Connect'.
-    # Only VMs expose a size; agents' TotalSizeBytes is $null. De-duped by name (the B&R-agent endpoint
-    # returns a row per protection group). Ordered Server -> Workstation -> VM, then by name.
+    # Destination is WHERE the backup lives, from the managing server's role: Client -> 'Local B&R',
+    # Hosted -> 'Hosted', CloudConnect -> 'Cloud Connect' ('' if the role can't be resolved). The workload
+    # kind (agent vs VM) is intentionally NOT stored here - it's already conveyed by Type (a VM-source
+    # entity is Type 'VM'; an agent is 'Server'/'Workstation'), so a separate "Agent/VM" label is redundant.
+    # Only VMs expose a size; agents' TotalSizeBytes is $null. De-duped by name + destination (the B&R-agent
+    # endpoint returns a row per protection group). Ordered Server -> Workstation -> VM, then by name.
     param([string]$BaseURL, [string]$Token, [string]$CompanyUid)
-    $dot = [char]0x00B7
     $destMap = @{ 'Client' = 'Local B&R'; 'Hosted' = 'Hosted'; 'CloudConnect' = 'Cloud Connect' }
     # server uid -> role
     $role = @{}
@@ -812,11 +815,9 @@ function Get-VspcCompanyBackup {
     try {
         foreach ($vm in @(Get-VspcPaged -BaseURL $BaseURL -Token $Token -Path '/api/v3/protectedWorkloads/virtualMachines' | Where-Object { $_.organizationUid -eq $CompanyUid })) {
             $size = $null; try { $size = [int64]$vm.totalRestorePointSize } catch { }
-            $dest = $destMap["$($role["$($vm.backupServerUid)"])"]
-            $bt = if ($dest) { "VM $dot $dest" } else { 'VM' }
             $entities += [pscustomobject]@{
                 Name = "$($vm.name)"; Type = 'VM'; LatestBackupUtc = (ConvertTo-UtcOrNull $vm.latestRestorePointDate)
-                TotalSizeBytes = $size; BackupType = $bt
+                TotalSizeBytes = $size; Destination = "$($destMap["$($role["$($vm.backupServerUid)"])"])"
             }
         }
     } catch { }
@@ -825,28 +826,40 @@ function Get-VspcCompanyBackup {
         foreach ($a in @(Get-VspcPaged -BaseURL $BaseURL -Token $Token -Path '/api/v3/protectedWorkloads/computersManagedByConsole' | Where-Object { $_.organizationUid -eq $CompanyUid })) {
             $entities += [pscustomobject]@{
                 Name = "$($a.name)"; Type = "$($a.operationMode)"; LatestBackupUtc = (ConvertTo-UtcOrNull $a.latestRestorePointDate)
-                TotalSizeBytes = $null; BackupType = "Agent $dot Cloud Connect"
+                TotalSizeBytes = $null; Destination = 'Cloud Connect'
             }
         }
     } catch { }
     # Agents managed by a B&R server -> role gives Local B&R / Hosted / Cloud Connect
     try {
         foreach ($a in @(Get-VspcPaged -BaseURL $BaseURL -Token $Token -Path '/api/v3/protectedWorkloads/computersManagedByBackupServer' | Where-Object { $_.organizationUid -eq $CompanyUid })) {
-            $dest = $destMap["$($role["$($a.backupServerUid)"])"]
-            $bt = if ($dest) { "Agent $dot $dest" } else { 'Agent' }
             $entities += [pscustomobject]@{
                 Name = "$($a.name)"; Type = "$($a.operationMode)"; LatestBackupUtc = (ConvertTo-UtcOrNull $a.latestRestorePointDate)
-                TotalSizeBytes = $null; BackupType = $bt
+                TotalSizeBytes = $null; Destination = "$($destMap["$($role["$($a.backupServerUid)"])"])"
             }
         }
     } catch { }
 
-    # De-dup by name: keep the freshest record (and prefer one carrying a size).
-    $deduped = foreach ($g in ($entities | Where-Object { $_.Name } | Group-Object { $_.Name.ToLowerInvariant() })) {
+    # De-dup by name + destination: collapse true duplicate rows (the B&R-agent endpoint returns a row per
+    # protection group, and the API can repeat identical records), keeping the freshest (and one carrying a
+    # size) - but PRESERVE genuinely distinct jobs that differ by destination (e.g. a server with both a
+    # Local B&R backup and a Cloud Connect copy), so the caller can list each job.
+    $deduped = foreach ($g in ($entities | Where-Object { $_.Name } | Group-Object { $_.Name.ToLowerInvariant() + '|' + $_.Destination })) {
         @($g.Group | Sort-Object @{ Expression = { $_.LatestBackupUtc }; Descending = $true }, @{ Expression = { [bool]$_.TotalSizeBytes }; Descending = $true })[0]
     }
     $order = @{ 'Server' = 0; 'Workstation' = 1; 'VM' = 2 }
     return @($deduped | Sort-Object @{ Expression = { $o = $order["$($_.Type)"]; if ($null -eq $o) { 9 } else { $o } } }, @{ Expression = { $_.Name } })
+}
+
+function Get-VeeamDestRank {
+    # Sort rank for a Veeam job's Destination so a device's jobs list LOCAL first, then off-site copies
+    # (Hosted, then Cloud Connect / sync), then anything else. Keeps "local listed first" regardless of
+    # which second job a device carries.
+    param([string]$Destination)
+    if ($Destination -match 'Local')         { return 0 }
+    if ($Destination -match 'Hosted')        { return 1 }
+    if ($Destination -match 'Cloud Connect') { return 2 }
+    return 3
 }
 
 # ---- IT Glue (READ-ONLY) ----
@@ -938,8 +951,9 @@ if (Test-Path $BrandCachePath) {
 }
 $script:IconMap = @{
     'itglue.com'      = @{ Color = '#3860be'; Logo = 'data:image/png;base64,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' }
-    'connectwise.com' = @{ Color = '#5ea4de'; Logo = 'https://cdn.brandfetch.io/idejubPisD/w/400/h/400/theme/dark/icon.jpeg?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    'connectwise.com' = @{ Color = '#5ea4de'; Px = 24; Logo = 'data:image/webp;base64,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' }
     'sentinelone.com' = @{ Color = '#6b0aea'; Logo = 'https://cdn.brandfetch.io/idqbZJLrXa/w/400/h/400/theme/dark/icon.png?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
+    'screenconnect.com' = @{ Color = '#26259f'; Logo = 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSpniA5cYd-w-2zsZwAYVSmefXZlGWUYcDsTyxj9ItieA&s' }
     'bitdefender.com' = @{ Color = '#EB0000'; Logo = 'https://cdn.brandfetch.io/idtcaX4QNF/w/400/h/400/theme/dark/icon.png?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
     'duo.com'         = @{ Color = '#74bf4b'; Logo = 'https://cdn.brandfetch.io/id7s-uuKhk/w/400/h/400/theme/dark/icon.png?c=1bxljtlqy4vv80d5kade1ohx1blb2u0lzBN' }
     'cloudflare.com'  = @{ Color = '#F38020'; Logo = 'data:image/png;base64,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' }
@@ -1005,6 +1019,14 @@ function Resolve-Brand {
 #            over-provisioned licenses, Duo bypass users, etc.
 #   Kind 'pill' = logo + Label button; Kind 'number' = big Label over small Sub (always muted, no logo).
 # ==============================================================================
+function Format-CountNoun {
+    # "<count> <noun>" with the noun pluralised only when count != 1: 1 workstation / 2 workstations.
+    # -Plural overrides the default (singular + 's') for irregular nouns.
+    param([int]$Count, [string]$Singular, [string]$Plural = '')
+    $noun = if ($Count -eq 1) { $Singular } elseif ($Plural) { $Plural } else { "${Singular}s" }
+    "$Count $noun"
+}
+
 function New-CardItem {
     # -Detail makes the pill EXPANDABLE: it renders as a <details>/<summary> disclosure (native, no JS),
     # and clicking it opens a panel of detail rows below the pill, inside the card. -Detail is an array
@@ -1012,20 +1034,73 @@ function New-CardItem {
     # panel heading. When a pill is expandable AND has a -Link, the link moves INSIDE the panel (rendered
     # as "<LinkText> ->") instead of making the whole pill an anchor. An empty -Detail leaves the pill
     # non-expandable (a plain pill, or a direct link if -Link is set) - so detail-less data degrades cleanly.
+    # -Actions is an ordered array of New-Action objects (destination icon links). When set, the pill's
+    # link becomes a row of vendor icon-tiles (rendered at the bottom of the panel for an expandable pill,
+    # or on the right of a plain pill) instead of the legacy "<LinkText> ->" / whole-pill anchor. -Link is
+    # kept for back-compat but -Actions supersedes it.
     param(
         [string]$Label, [string]$Sub = '', [string]$Link = '', [string]$LinkText = '', [string]$Brand = '',
         [string]$Bg = '', [switch]$Muted, [switch]$Alert, [string]$Ring = '', [ValidateSet('pill','number')][string]$Kind = 'pill',
-        [object[]]$Detail = @(), [string]$DetailHead = ''
+        [object[]]$Detail = @(), [string]$DetailHead = '', [object[]]$Actions = @()
     )
-    [pscustomobject]@{ Label = $Label; Sub = $Sub; Link = $Link; LinkText = $LinkText; Brand = $Brand; Bg = $Bg; Muted = [bool]$Muted; Alert = [bool]$Alert; Ring = $Ring; Kind = $Kind; Detail = @($Detail); DetailHead = $DetailHead }
+    [pscustomobject]@{ Label = $Label; Sub = $Sub; Link = $Link; LinkText = $LinkText; Brand = $Brand; Bg = $Bg; Muted = [bool]$Muted; Alert = [bool]$Alert; Ring = $Ring; Kind = $Kind; Detail = @($Detail); DetailHead = $DetailHead; Actions = @($Actions) }
 }
 
 function New-DetailRow {
     # One row in an expandable pill's panel. With -K it renders as a "key .... value" row (value coloured
     # by -State: 'bad' red, 'ok' green); with only -V it renders as a plain list item (e.g. a username or
-    # device name). -Link makes the value a clickable link (e.g. a firewall WAN IP). See New-CardItem -Detail.
-    param([string]$K = '', [string]$V = '', [ValidateSet('','ok','bad')][string]$State = '', [string]$Link = '')
-    [pscustomobject]@{ K = $K; V = $V; State = $State; Link = $Link }
+    # device name). -Actions attaches one or more destination icon-tiles to the row (e.g. a server name +
+    # ScreenConnect + Automate icons); -Link is the legacy single-link form (kept for back-compat).
+    # -Record marks a V-only line as a single-string DNS record (SPF/DMARC) rather than a list item: it
+    # reads best on one line, so it (unlike a name/device member) drives the card's width (Test-HasLongValue).
+    param([string]$K = '', [string]$V = '', [ValidateSet('','ok','bad')][string]$State = '', [string]$Link = '', [object[]]$Actions = @(), [switch]$NoUnderline, [switch]$Record)
+    [pscustomobject]@{ K = $K; V = $V; State = $State; Link = $Link; Actions = @($Actions); NoUnderline = [bool]$NoUnderline; Record = [bool]$Record }
+}
+
+# Destination registry: dest key -> the IconMap brand whose logo represents it + the hover tooltip. Each
+# clickable object carries an ordered list of New-Action @{ Dest; Url }, rendered as a cluster of small
+# vendor icon-tiles by Format-DestIcons. 'web' has no vendor (a firewall's own admin UI) -> a globe glyph.
+$script:DestIcon = @{
+    screenconnect = @{ Brand = 'screenconnect.com'; Title = 'Launch Control (ScreenConnect) session' }
+    automate      = @{ Brand = 'automate';          Title = 'Open in ConnectWise Automate' }
+    itglue        = @{ Brand = 'itglue.com';        Title = 'Open IT Glue record' }
+    unifi         = @{ Brand = 'ui.com';            Title = 'Open UniFi site' }
+    duo           = @{ Brand = 'duo.com';           Title = 'Open Duo admin' }
+    sentinelone   = @{ Brand = 'sentinelone.com';   Title = 'Open SentinelOne console' }
+    bitdefender   = @{ Brand = 'bitdefender.com';   Title = 'Open Bitdefender console' }
+    connectwise   = @{ Brand = 'connectwise.com';   Title = 'Open in ConnectWise Manage' }
+    cloudflare    = @{ Brand = 'cloudflare.com';    Title = 'Open Cloudflare DNS' }
+}
+
+function New-Action {
+    # One destination link on an object: -Dest is a key into $script:DestIcon, -Url its target. Empty/blank
+    # urls are tolerated by the caller (filtered in Format-DestIcons) so optional links degrade cleanly.
+    param([Parameter(Mandatory)][string]$Dest, [string]$Url = '')
+    [pscustomobject]@{ Dest = $Dest; Url = $Url }
+}
+
+function Format-DestIcons {
+    # Render an array of New-Action objects as a horizontal cluster of clickable vendor icon-tiles. Each
+    # tile reuses the pill-logo look (white rounded square + brand logo) so it survives publishing to IT
+    # Glue; the icon IS the link (the object's name stays plain text).
+    # Actions with a blank Url, or an unknown Dest, are skipped. Returns '' when nothing renders.
+    param([object[]]$Actions)
+    $tiles = New-Object System.Collections.Generic.List[string]
+    foreach ($a in @($Actions)) {
+        if (-not $a -or [string]::IsNullOrWhiteSpace($a.Url)) { continue }
+        $d = $script:DestIcon["$($a.Dest)"]
+        if (-not $d) { continue }
+        $b = Resolve-Brand $d.Brand
+        $logo = if ($b) { $b.Logo } else { '' }
+        if (-not $logo) { continue }
+        $title = Get-HtmlEncoded $d.Title
+        $tiles.Add(
+            "<a class=`"dest`" href=`"$($a.Url)`" target=`"_blank`" rel=`"noopener`" title=`"$title`" aria-label=`"$title`" " +
+            "style=`"display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:7px;background:#fff;flex:none;text-decoration:none;`">" +
+            "<img src=`"$logo`" alt=`"`" width=`"14`" height=`"14`" style=`"display:block;width:14px;height:14px;object-fit:contain;`"></a>")
+    }
+    if ($tiles.Count -eq 0) { return '' }
+    return "<span style=`"display:inline-flex;gap:6px;flex:none;`">$($tiles -join '')</span>"
 }
 
 function New-Card {
@@ -1038,7 +1113,7 @@ function New-Card {
 # Brand key -> vendor display name, used to label the auto-generated vendor bands (Group-CardItems).
 # A pill is only banded if its Brand appears here (so unknown/iconless pills render flat).
 $script:BrandName = @{
-    'connectwise.com' = 'ConnectWise'; 'itglue.com' = 'IT Glue'; 'duo.com' = 'Duo'
+    'connectwise.com' = 'ConnectWise Manage'; 'itglue.com' = 'IT Glue'; 'duo.com' = 'Duo'
     'microsoft.com' = 'Microsoft 365'; 'azuread' = 'Microsoft 365'; 'winserver' = 'Domains'
     'automate' = 'ConnectWise Automate'; 'sentinelone.com' = 'SentinelOne'; 'bitdefender.com' = 'Bitdefender'
     'sonicwall.com' = 'SonicWall'; 'captureclient' = 'Capture Client'; 'cloudappsecurity' = 'Cloud App Security'; 'watchguard.com' = 'WatchGuard'; 'ui.com' = 'UniFi'
@@ -1087,7 +1162,7 @@ function Get-DashAntivirus {
             $s1Link = if ($site.ConsoleURL) {
                 "$($site.ConsoleURL)/unified-assets?_scopeId=$($site.Id)&_scopeLevel=site&_categoryId=inventory&activeTabFromPreferences=true&activeTab=endpoint"
             } else { '' }
-            $lines += New-CardItem -Label "$($site.Instance): $([int]$site.ActiveLicenses) devices" -Link $s1Link -Brand 'sentinelone.com'
+            $lines += New-CardItem -Label "$($site.Instance): $(Format-CountNoun ([int]$site.ActiveLicenses) 'device')" -Actions @(New-Action -Dest 'sentinelone' -Url $s1Link) -Brand 'sentinelone.com'
         }
     }
 
@@ -1106,7 +1181,7 @@ function Get-DashAntivirus {
             # so no EDR/MDR label on this pill).
             if ([int]$count -gt 0) {
                 $bdLink = "$($Creds.Bitdefender.URL.TrimEnd('/'))/#!/network"
-                $lines += New-CardItem -Label "$([int]$count) devices" -Link $bdLink -Brand 'bitdefender.com'
+                $lines += New-CardItem -Label "$([int]$count) devices" -Actions @(New-Action -Dest 'bitdefender' -Url $bdLink) -Brand 'bitdefender.com'
             }
         }
     }
@@ -1117,6 +1192,8 @@ function Get-DashAntivirus {
     if ($Entry.PSObject.Properties['duo'] -and $Entry.duo) {
         $duoDev = Get-AutomateDuoLogonItem -Entry $Entry -OrgName $OrgName
         if ($duoDev) { $lines += $duoDev }
+        $duoProxy = Get-AutomateDuoProxyItem -Entry $Entry -OrgName $OrgName
+        if ($duoProxy) { $lines += $duoProxy }
     }
 
     return New-Card -Title 'Endpoint Security' -Items $lines
@@ -1127,6 +1204,8 @@ function Get-DashIdentity {
     # (all three via CIPP), and the on-prem AD domain + domain controllers (via Automate).
     param([pscustomobject]$Entry, [string]$OrgId, [string]$OrgName, [hashtable]$Creds, [pscustomobject]$CippTenant)
     $lines = @()
+    $duoMatched = $false   # set once the org resolves to a Duo account; gates the MFA pill's Duo SSO section
+    $duoAdminUrl = ''      # the matched org's Duo admin portal URL; reused as the MFA pill's Duo SSO shortcut
 
     # 1) Duo. The duo.com logo identifies the pill, so the label drops the 'Duo:' prefix.
     if ($Creds.Duo.Configured) {
@@ -1141,8 +1220,10 @@ function Get-DashIdentity {
 
         $acct = Resolve-OrgServiceId -Entry $Entry -VendorKey 'duo' -VendorLabel 'Duo' -OrgName $OrgName -Candidates $accounts
         if ($acct) {
+            $duoMatched = $true   # org has Duo -> the M365 MFA pill can surface its Duo SSO federation state
             # Duo's per-customer admin panel is the api_hostname with 'api-' swapped for 'admin-'.
             $adminUrl = if ($acct.ApiHostname) { 'https://' + ($acct.ApiHostname -replace '^api-', 'admin-') } else { '' }
+            $duoAdminUrl = $adminUrl   # reused as the MFA pill's Duo SSO shortcut
             try {
                 $c = Get-DuoUserCounts -Creds $Creds -AccountId $acct.Id -ApiHost $acct.ApiHostname
                 # Expand the pill into a posture summary (counts) followed by the actionable name lists,
@@ -1155,16 +1236,18 @@ function Get-DashIdentity {
                 $detail += New-DetailRow -K 'Bypass' -V "$($c.Bypass)" -State $(if ($c.Bypass -gt 0) {'bad'} else {''})
                 if ($c.BypassNames.Count)      { $detail += @($c.BypassNames      | ForEach-Object { New-DetailRow -V $_ }) }
                 $detail += New-DetailRow -K 'Disabled'     -V "$($c.Disabled)"
+                if ($c.DisabledNames.Count)    { $detail += @($c.DisabledNames    | ForEach-Object { New-DetailRow -V $_ }) }
                 $detail += New-DetailRow -K 'Locked out'   -V "$($c.LockedOut)" -State $(if ($c.LockedOut -gt 0) {'bad'} else {''})
+                if ($c.LockedOutNames.Count)   { $detail += @($c.LockedOutNames   | ForEach-Object { New-DetailRow -V $_ }) }
                 $detail += New-DetailRow -K 'Not enrolled' -V "$($c.NotEnrolled)"
                 if ($c.NotEnrolledNames.Count) { $detail += @($c.NotEnrolledNames | ForEach-Object { New-DetailRow -V $_ }) }
                 $detail += New-DetailRow -K 'Stale (90+ days)' -V "$($c.Stale)"
-                $lines += New-CardItem -Label "$($c.Active) active users" -Link $adminUrl -LinkText 'Open Duo admin' `
+                $lines += New-CardItem -Label "$($c.Active) active users" -Actions @(New-Action -Dest 'duo' -Url $adminUrl) `
                     -Detail $detail -Brand 'duo.com' -Alert:($c.Bypass -gt 0 -or $c.LockedOut -gt 0)
             }
             # The client IS in Duo (account resolved), so still render a linked Duo pill - just without
             # the count - rather than a dead 'n/a'. The console warning carries the real failure reason.
-            catch { Write-Status "  Duo user count failed for '$($acct.Name)': $($_.Exception.Message)" Warning; $lines += New-CardItem -Label 'Managed' -Link $adminUrl -Brand 'duo.com' }
+            catch { Write-Status "  Duo user count failed for '$($acct.Name)': $($_.Exception.Message)" Warning; $lines += New-CardItem -Label 'Managed' -Actions @(New-Action -Dest 'duo' -Url $adminUrl) -Brand 'duo.com' }
         }
     }
 
@@ -1173,8 +1256,8 @@ function Get-DashIdentity {
     if ($CippTenant -and $CippTenant.Domain) {
         $msItems = @()
         $usr  = Get-CippUsersItem -TenantFilter $CippTenant.Domain; if ($usr)  { $msItems += $usr }
-        $mfa  = Get-CippMfaItem  -TenantFilter $CippTenant.Domain; if ($mfa)  { $msItems += $mfa }
-        $sync = Get-CippSyncItem -TenantFilter $CippTenant.Domain; if ($sync) { $msItems += $sync }
+        $mfa  = Get-CippMfaItem  -TenantFilter $CippTenant.Domain -HasDuo:$duoMatched -DuoAdminUrl $duoAdminUrl; if ($mfa)  { $msItems += $mfa }
+        $sync = Get-CippSyncItem -TenantFilter $CippTenant.Domain -Entry $Entry -OrgName $OrgName; if ($sync) { $msItems += $sync }
         if ($msItems.Count -gt 0) { $lines += New-CardGroup -Label 'Microsoft 365' -Brand 'microsoft.com' -Items $msItems }
     }
 
@@ -1198,18 +1281,36 @@ function Get-DashBackup {
             $companies = Get-VspcCompanies -BaseURL $Creds.VeeamVspc.URL -Token $token
             $company = Resolve-OrgServiceId -Entry $Entry -VendorKey 'veeam' -VendorLabel 'Veeam VSPC' -OrgName $OrgName -Candidates $companies
             if ($company) {
-                # One multi-line pill per protected entity inside a 'Veeam' sub-box: device name on top,
-                # "<age> ago [, size] - <backup type>" below. Each pill gets a red ring if its own last
-                # backup is missing or >25h old (25, not 24, to avoid false positives from daily drift).
+                # One EXPANDABLE pill per protected device inside a 'Veeam' sub-box: the pill shows just the
+                # device name; clicking it opens a panel with the device type, then each backup job's type,
+                # last-backup age, and size. A device with more than one job (e.g. a Local B&R backup plus a
+                # Cloud Connect copy / sync) lists every job, LOCAL first. The pill gets a red ring when the
+                # freshest backup across its jobs is missing or >25h old (25, not 24, to avoid false positives
+                # from daily drift).
                 $cutoff = (Get-Date).ToUniversalTime().AddHours(-25)
-                $dot = [char]0x00B7
                 $veeamItems = @()
-                foreach ($e in (Get-VspcCompanyBackup -BaseURL $Creds.VeeamVspc.URL -Token $token -CompanyUid $company.Id)) {
-                    $parts = @(if ($e.LatestBackupUtc) { Format-RelativeAge $e.LatestBackupUtc } else { 'no backup' })
-                    $size = Format-BackupSize $e.TotalSizeBytes; if ($size) { $parts += $size }
-                    if ($e.BackupType) { $parts += $e.BackupType }
-                    $ring = if ((-not $e.LatestBackupUtc) -or ($e.LatestBackupUtc -lt $cutoff)) { '#DC3545' } else { '' }
-                    $veeamItems += New-CardItem -Label $e.Name -Sub ($parts -join " $dot ") -Ring $ring
+                $entities = Get-VspcCompanyBackup -BaseURL $Creds.VeeamVspc.URL -Token $token -CompanyUid $company.Id
+                foreach ($grp in ($entities | Group-Object { "$($_.Name)" })) {
+                    $jobs = @($grp.Group | Sort-Object @{ Expression = { Get-VeeamDestRank "$($_.Destination)" } },
+                                                       @{ Expression = { $_.LatestBackupUtc }; Descending = $true })
+                    $name = "$($grp.Group[0].Name)"
+                    $type = "$($grp.Group[0].Type)"
+                    $freshest = @($jobs | ForEach-Object { $_.LatestBackupUtc } | Where-Object { $_ } | Sort-Object -Descending)[0]
+                    $ring = if ((-not $freshest) -or ($freshest -lt $cutoff)) { '#DC3545' } else { '' }
+                    # Device type once at the top (the device property), then each backup job keyed by its
+                    # destination - Local first - with that job's size and last-backup age. We don't repeat an
+                    # "agent/VM" label: Type already says VM vs Server/Workstation.
+                    $detail = @(New-DetailRow -K 'Device type' -V $type)
+                    foreach ($j in $jobs) {
+                        $stale = (-not $j.LatestBackupUtc) -or ($j.LatestBackupUtc -lt $cutoff)
+                        $age   = if ($j.LatestBackupUtc) { Format-RelativeAge $j.LatestBackupUtc } else { 'no backup' }
+                        $size  = Format-BackupSize $j.TotalSizeBytes; if (-not $size) { $size = [char]0x2014 }  # em dash when agents expose no size
+                        $dest  = if ($j.Destination) { "$($j.Destination)" } else { 'Unknown' }
+                        $detail += New-DetailRow -K 'Backup type' -V $dest
+                        $detail += New-DetailRow -K 'Size'        -V $size
+                        $detail += New-DetailRow -K 'Last backup' -V $age -State $(if ($stale) { 'bad' } else { 'ok' })
+                    }
+                    $veeamItems += New-CardItem -Label $name -Detail $detail -Ring $ring
                 }
                 if ($veeamItems.Count -gt 0) { $lines += New-CardGroup -Label 'Veeam' -Brand 'veeam.com' -Items $veeamItems }
             }
@@ -1249,14 +1350,16 @@ function Get-DashBackup {
 }
 
 function Get-CloudflareZones {
-    # All zone (domain) names the API token can see, paged. Used to tell domains that are in OUR
-    # self-service Cloudflare portal from domains merely using Cloudflare NS via a web host.
+    # Every zone the API token can see, as @{ Name (lowercased domain); AccountId } - paged. Used to tell
+    # domains in OUR self-service Cloudflare portal from domains merely using Cloudflare NS via a web host,
+    # and to deep-link a portal domain to its DNS in the dashboard (the account id varies per zone, since
+    # clients sit in separate Cloudflare accounts, so it must come from the API).
     param([string]$ApiToken)
     $zones = @(); $page = 1
     $h = @{ Authorization = "Bearer $ApiToken" }
     do {
         $r = Invoke-RestMethod -Uri "https://api.cloudflare.com/client/v4/zones?per_page=50&page=$page" -Headers $h -Method Get
-        if ($r.result) { $zones += @($r.result | ForEach-Object { "$($_.name)".ToLowerInvariant() }) }
+        if ($r.result) { $zones += @($r.result | ForEach-Object { [pscustomobject]@{ Name = "$($_.name)".ToLowerInvariant(); AccountId = "$($_.account.id)" } }) }
         $totalPages = [int]$r.result_info.total_pages
         $page++
     } while ($page -le $totalPages -and $totalPages -gt 0)
@@ -1264,15 +1367,16 @@ function Get-CloudflareZones {
 }
 
 function Get-CloudflarePortalSet {
-    # The set of zones in OUR Cloudflare portal (lowercased zone name -> $true), used only to colour
-    # domain pills with the Cloudflare logo. Loaded LAZILY on first use and cached for the run, so a
-    # single-org run with no Domains card never makes the (whole-account) zone call. Returns an empty
-    # set when Cloudflare isn't configured or the load fails (domains just fall back to their NS brand).
+    # The zones in OUR Cloudflare portal as a map: lowercased zone name -> its Cloudflare account id. Used
+    # to colour domain pills with the Cloudflare logo AND to deep-link a portal domain to its DNS records
+    # in the dashboard. Loaded LAZILY on first use and cached for the run, so a single-org run with no
+    # Domains card never makes the (whole-account) zone call. Returns an empty map when Cloudflare isn't
+    # configured or the load fails (domains just fall back to their NS brand and IT Glue link).
     if ($null -ne $script:CloudflarePortal) { return $script:CloudflarePortal }
     $script:CloudflarePortal = @{}
     if ($script:CloudflareConfigured) {
         try {
-            foreach ($z in (Get-CloudflareZones -ApiToken $script:CloudflareToken)) { $script:CloudflarePortal[$z] = $true }
+            foreach ($z in (Get-CloudflareZones -ApiToken $script:CloudflareToken)) { $script:CloudflarePortal[$z.Name] = $z.AccountId }
             Write-Status "Cloudflare portal: $($script:CloudflarePortal.Count) zones loaded." Detail
         } catch { Write-Status "Cloudflare zone load failed: $($_.Exception.Message)" Warning }
     }
@@ -1304,6 +1408,83 @@ function Get-NameserverBrand {
             return ''
         }
     }
+}
+
+function Get-DomainDeliverability {
+    # Live DNS read of a domain's email-authentication posture (SPF / DKIM / DMARC) for the Email card's
+    # Deliverability pills. All lookups go to a PUBLIC resolver (1.1.1.1) so the box's internal AD /
+    # split-horizon DNS can't mask the real external record. Every record type is independent; a missing
+    # record makes Resolve-DnsName throw, so each lookup is wrapped. Returns per-record value + state
+    # ('ok'/'bad') plus AllOk (true only when all three are 'ok'). DKIM assumes the M365 selector pattern.
+    param([string]$Domain)
+    $dns = @{ Server = '1.1.1.1'; QuickTimeout = $true; ErrorAction = 'Stop' }
+
+    # -- SPF: a single TXT at the apex starting v=spf1. More than one SPF record is invalid (RFC 7208);
+    #    must end in an 'all' qualifier, and +all (passes everything) is treated as broken.
+    $spf = 'Missing'; $spfState = 'bad'
+    try {
+        $txt = @(Resolve-DnsName -Name $Domain -Type TXT @dns |
+                 Where-Object { $_.Type -eq 'TXT' } |
+                 ForEach-Object { ($_.Strings -join '') } |
+                 Where-Object { $_ -match '^v=spf1\b' })
+        if ($txt.Count -gt 1) {
+            $spf = "Invalid: $($txt.Count) SPF records"; $spfState = 'bad'
+        } elseif ($txt.Count -eq 1) {
+            $spf = $txt[0]
+            if ($spf -match '(?i)([-~?+])all\s*$' -and $matches[1] -ne '+') { $spfState = 'ok' } else { $spfState = 'bad' }
+        }
+    } catch { }
+
+    # -- DKIM: M365 publishes selector1/selector2 CNAMEs under _domainkey. Both present = custom-domain
+    #    DKIM is set up; otherwise the tenant is signing only with its onmicrosoft domain.
+    $present = @()
+    foreach ($sel in 'selector1','selector2') {
+        try {
+            $c = @(Resolve-DnsName -Name "$sel._domainkey.$Domain" -Type CNAME @dns | Where-Object { $_.Type -eq 'CNAME' })
+            if ($c.Count -gt 0) { $present += $sel }
+        } catch { }
+    }
+    if ($present.Count -eq 2) { $dkim = 'Published'; $dkimState = 'ok' }
+    elseif ($present.Count -eq 1) { $dkim = 'Partial'; $dkimState = 'bad' }
+    else { $dkim = 'Not published'; $dkimState = 'bad' }
+
+    # -- DMARC: a TXT at _dmarc.<domain> starting v=DMARC1. Present counts as ok; p=none is surfaced so a
+    #    monitor-only policy is visible without being flagged as a failure.
+    $dmarc = 'Missing'; $dmarcState = 'bad'
+    try {
+        $rec = @(Resolve-DnsName -Name "_dmarc.$Domain" -Type TXT @dns |
+                 Where-Object { $_.Type -eq 'TXT' } |
+                 ForEach-Object { ($_.Strings -join '') } |
+                 Where-Object { $_ -match '^v=DMARC1\b' }) | Select-Object -First 1
+        if ($rec) { $dmarc = $rec; $dmarcState = 'ok' }
+    } catch { }
+
+    [pscustomobject]@{
+        Spf = $spf; SpfState = $spfState
+        Dkim = $dkim; DkimState = $dkimState
+        Dmarc = $dmarc; DmarcState = $dmarcState
+        AllOk = ($spfState -eq 'ok' -and $dkimState -eq 'ok' -and $dmarcState -eq 'ok')
+    }
+}
+
+function New-DnsRecordRows {
+    # Render one DNS record (SPF/DMARC) as Deliverability detail rows. A real record (-Present) is shown
+    # as a label caption followed by one V-only member line per -Split token; member lines word-break and
+    # indent, so a long SPF/DMARC string is listed cleanly instead of spilling out of the panel. A
+    # missing/invalid status (not -Present) collapses to a single red key/value row so the gap stays obvious.
+    param([string]$Label, [string]$Value, [string]$State, [bool]$Present, [string]$Split = '\s+')
+    if ($Present) {
+        $tokens = @($Value -split $Split | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        # When splitting on ';' (DMARC), keep the ';' visible on every token but the last so the
+        # listed record still reads as syntactically correct (v=DMARC1; / p=none / ...).
+        if ($Split -eq ';') {
+            $tokens = @(for ($i = 0; $i -lt $tokens.Count; $i++) {
+                if ($i -lt $tokens.Count - 1) { "$($tokens[$i]);" } else { $tokens[$i] }
+            })
+        }
+        return @(New-DetailRow -K $Label) + @($tokens | ForEach-Object { New-DetailRow -V $_ -Record })
+    }
+    return @(New-DetailRow -K $Label -V $Value -State $State)
 }
 
 # ---- CIPP (M365 data via the CIPP API: MFA + Entra/AD sync) ----
@@ -1416,12 +1597,36 @@ function Get-CippUsersItem {
         return New-CardItem -Label "$total users" -Brand 'microsoft.com' -Detail $detail
     } catch { Write-Status "  CIPP users query failed: $($_.Exception.Message)" Warning; return $null }
 }
+function Test-DuoFederationState {
+    # Is the tenant's M365 sign-in federated to Duo SSO? Duo SSO for M365 (duo.com/docs/sso-m365) works by
+    # FEDERATING the domain to Duo as the SAML IdP - so the authoritative signal is a domain whose Graph
+    # authenticationType is 'Federated' AND whose federationConfiguration points at *.duosecurity.com.
+    # (The Duo M365 'Cloud Application' existing in the Duo panel is NOT visible via the Duo Admin API and
+    # does nothing on its own until the domain is federated to it - see [[duo-sso-m365-detection]].)
+    # Returns $true only when a verified domain is federated specifically to Duo.
+    param([string]$TenantFilter)
+    try {
+        $domains = @(Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint 'domains?$select=id,authenticationType')
+        foreach ($d in @($domains | Where-Object { "$($_.authenticationType)" -eq 'Federated' })) {
+            try {
+                $cfg = @(Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint "domains/$($d.id)/federationConfiguration")
+                foreach ($c in $cfg) {
+                    $uris = "$($c.issuerUri) $($c.passiveSignInUri) $($c.activeSignInUri)"
+                    if ($uris -match '(?i)duosecurity\.com') { return $true }
+                }
+            } catch {}   # a Managed domain 400s on federationConfiguration; just means "not this one"
+        }
+    } catch { Write-Status "  CIPP domain federation query failed: $($_.Exception.Message)" Warning }
+    return $false
+}
 function Get-CippMfaItem {
     # MFA posture via CIPP's ListMFAUsers report (Get-CIPPMFAState). Unlike the raw Graph
     # userRegistrationDetails report, this returns per-user accountEnabled / userType / CA-coverage /
     # security-defaults / per-user MFA state, so we can both scope the denominator and measure real
     # ENFORCEMENT (not just "has registered a method"). Real-time call (no UseReportDB), one per tenant.
-    param([string]$TenantFilter)
+    # -HasDuo: the org resolved to a Duo account, so the panel surfaces its Duo SSO federation state.
+    # -DuoAdminUrl: that org's Duo admin portal, rendered as a shortcut icon beside the federation status.
+    param([string]$TenantFilter, [bool]$HasDuo, [string]$DuoAdminUrl)
     try {
         $resp = Invoke-RestMethod -Uri "$($script:CippApiUrl)/api/ListMFAUsers?TenantFilter=$([uri]::EscapeDataString($TenantFilter))" -Headers @{ Authorization = "Bearer $($script:CippToken)" }
         # CIPP returns the user list as a bare array on a fresh compute but wraps it in an OData-style
@@ -1453,6 +1658,23 @@ function Get-CippMfaItem {
         # users / WatchGuard pill look. Empty when everyone's covered -> the pill degrades to a plain
         # non-expandable pill.
         $detail = @()
+        # Duo SSO section (only when the org has a matched Duo account). The pill TEXT is unchanged - this
+        # just explains the count: when M365 is federated to Duo, sign-in MFA is delegated to Duo (so the
+        # CA/SD/per-user view above legitimately reads 0 enforced), and we don't flag the pill. When it's
+        # NOT federated, the Duo M365 SSO app (if any) is inert, so we say so - red only if MFA is in fact
+        # unenforced (mirrors the pill's own alert), else neutral.
+        $federated = $false
+        if ($HasDuo) {
+            $federated = Test-DuoFederationState -TenantFilter $TenantFilter
+            # A Duo admin-portal shortcut sits to the right of the status (the duo.com icon is the link).
+            $duoAct = if ($DuoAdminUrl) { @(New-Action -Dest 'duo' -Url $DuoAdminUrl) } else { @() }
+            $detail += New-DetailRow -K 'Duo'
+            if ($federated) {
+                $detail += New-DetailRow -V 'Federated' -State 'ok' -Actions $duoAct
+            } else {
+                $detail += New-DetailRow -V 'Not Federated' -State $(if ($enforced -lt $relevant.Count) { 'bad' } else { '' }) -Actions $duoAct
+            }
+        }
         if ($notEnforced.Count -gt 0) {
             $detail += New-DetailRow -K 'Not enforced' -V "$($notEnforced.Count)"
             $detail += @($notEnforced |
@@ -1460,17 +1682,19 @@ function Get-CippMfaItem {
                 Where-Object { $_ } | Sort-Object |
                 ForEach-Object { New-DetailRow -V $_ })
         }
-        # Flag (red outline) when not everyone who can sign in is covered.
+        # Flag (red outline) when not everyone who can sign in is covered - UNLESS M365 is federated to Duo
+        # (then sign-in MFA is enforced at Duo, not via CA/SD/per-user, so the 0-enforced count is expected).
         return New-CardItem -Label "$enforced/$($relevant.Count) MFA enforced" -Brand 'microsoft.com' `
-            -Detail $detail -Alert:($enforced -lt $relevant.Count)
+            -Detail $detail -Alert:(($enforced -lt $relevant.Count) -and -not $federated)
     } catch { Write-Status "  CIPP MFA query failed: $($_.Exception.Message)" Warning; return $null }
 }
 function Get-CippSyncItem {
     # Entra Connect (AD) sync pill for the Identity card's Microsoft 365 sub-box. When sync is on, the
-    # pill shows "Synced (<age> ago)" and EXPANDS to the M365 admin "Synced from on-premises vs In cloud"
-    # breakdown: the on-prem domain(s) members sync from, the synced-member count, and the cloud-only
-    # member count. Guests are excluded from both counts (their account/sync is owned by their home tenant).
-    param([string]$TenantFilter)
+    # pill shows "Synced (<age> ago)" and EXPANDS to: the sync server(s) running the Connect agent, the
+    # on-prem domain(s) members sync from, the synced-member count, and the cloud-only member count.
+    # Guests are excluded from both counts (their account/sync is owned by their home tenant). -Entry/-OrgName
+    # are used only to locate the sync host via Automate (see Get-AutomateSyncServers).
+    param([string]$TenantFilter, [pscustomobject]$Entry, [string]$OrgName)
     try {
         $o = @(Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint 'organization')[0]
         if ($o.onPremisesSyncEnabled) {
@@ -1484,6 +1708,7 @@ function Get-CippSyncItem {
             # Per-user breakdown (members only - drop guests). A user is "synced from on-premises" when
             # onPremisesSyncEnabled is true; the on-prem domain it syncs from is onPremisesDomainName.
             $detail = @()
+
             try {
                 $users   = @(Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint 'users?$select=userType,onPremisesSyncEnabled,onPremisesDomainName&$top=999')
                 $members = @($users | Where-Object { "$($_.userType)" -ne 'Guest' })
@@ -1491,14 +1716,24 @@ function Get-CippSyncItem {
                 $cloud   = @($members | Where-Object { $_.onPremisesSyncEnabled -ne $true })
                 $domains = @($synced | ForEach-Object { "$($_.onPremisesDomainName)".Trim() } | Where-Object { $_ } | Sort-Object -Unique)
                 if ($domains.Count -eq 1) {
-                    $detail += New-DetailRow -K 'Syncing from' -V $domains[0]
+                    $detail += New-DetailRow -K 'Source' -V $domains[0]
                 } elseif ($domains.Count -gt 1) {
-                    $detail += New-DetailRow -K 'Syncing from'
+                    $detail += New-DetailRow -K 'Source'
                     $detail += @($domains | ForEach-Object { New-DetailRow -V $_ })
                 }
                 $detail += New-DetailRow -K 'Synced users'     -V "$($synced.Count)"
                 $detail += New-DetailRow -K 'Cloud-only users' -V "$($cloud.Count)"
             } catch { Write-Status "  CIPP sync-user breakdown failed: $($_.Exception.Message)" Warning }
+
+            # Which server runs the Entra Connect / AD-sync agent. M365/Graph can't tell us reliably: classic
+            # Connect creates a cloud "Sync_<server>_<id>" account, but CIPP's user list filters it out, and
+            # cloud sync (the provisioning agent) creates no such account at all. So we find the host the same
+            # way the Duo-logon pill does - an Automate software search - which works for both. A sync server is
+            # a server, so its row sits at the BOTTOM of the panel with a ScreenConnect icon that launches the
+            # machine's Control session (same as the DC/Server rows). (No-op when the org has no Automate match.)
+            foreach ($srv in @(Get-AutomateSyncServers -Entry $Entry -OrgName $OrgName)) {
+                $detail += New-DetailRow -K 'Sync server' -V $srv.Name -Actions @(New-Action -Dest 'screenconnect' -Url (Get-AutomateControlLink -CompId "$($srv.Id)"))
+            }
             return New-CardItem -Label "Synced$rel" -Brand 'azuread' -Muted -Detail $detail
         }
         return New-CardItem -Label 'Cloud-only' -Brand 'azuread' -Muted
@@ -1530,9 +1765,15 @@ function Get-CippDeviceItems {
         }
         $computers = @($uniq | Where-Object { "$($_.operatingSystem)" -match '(?i)windows|mac' }).Count
         $mobile    = @($uniq | Where-Object { "$($_.operatingSystem)" -match '(?i)ios|ipad|android' }).Count
-        if ($computers -gt 0) { $items += New-CardItem -Label "$computers Intune computers" -Brand 'microsoft.com' }
+        if ($computers -gt 0) { $items += New-CardItem -Label "$(Format-CountNoun $computers 'Intune computer')" -Brand 'microsoft.com' }
         if ($mobile    -gt 0) { $items += New-CardItem -Label "$mobile Intune mobile" -Brand 'microsoft.com' }
-    } catch { Write-Status "  CIPP Intune devices query failed: $($_.Exception.Message)" Warning }
+    } catch {
+        # A 400 from the managedDevices endpoint means the tenant isn't licensed/enabled for Intune -
+        # expected for many clients, not an error. Note it calmly; keep the loud Warning for anything else.
+        $code = try { [int]$_.Exception.Response.StatusCode.value__ } catch { 0 }
+        if ($code -eq 400) { Write-Status "  Microsoft 365: tenant has no Intune - skipping Intune device counts" Detail }
+        else { Write-Status "  CIPP Intune devices query failed: $($_.Exception.Message)" Warning }
+    }
 
     try {
         $dev = @(Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint 'devices')
@@ -1581,22 +1822,26 @@ function Get-CippLicenseItems {
     } catch { Write-Status "  CIPP license query failed: $($_.Exception.Message)" Warning; return $null }
 }
 
-function Get-M365DomainItems {
-    # The org's verified custom M365 domains, sourced from the M365 portal (CIPP Graph 'domains'),
-    # returned as a single 'Domains' band (New-CardGroup) so each domain renders as its own pill under
-    # a Domains header. Excludes any *.onmicrosoft.com domain (the initial tenant domain AND the
-    # *.mail.onmicrosoft.com MOERA, which reports isInitial=false) and any unverified / incomplete-setup
-    # domain, so only the domains that actually matter (mail/web) are listed. Each pill links to its IT
-    # Glue domain record when one exists, else to the M365 admin Domains page; the default domain gets a
-    # green ring, and pills carry a DNS-host icon from their live NS records (Cloudflare-portal domains
-    # show the Cloudflare logo). Returns @() (no band) when M365 isn't resolved or there are no domains.
+function Get-DeliverabilityItems {
+    # The org's verified, MAIL-ENABLED custom M365 domains, sourced from the M365 portal (CIPP Graph
+    # 'domains'), returned as a single 'Deliverability' band (New-CardGroup) so each domain renders as its
+    # own pill. Excludes any *.onmicrosoft.com domain (the initial tenant domain AND the
+    # *.mail.onmicrosoft.com MOERA, which reports isInitial=false), any unverified / incomplete-setup
+    # domain, and any domain whose supportedServices doesn't include Email (web-only/parked customs) so
+    # the box stays mail-relevant. Each pill carries a DNS-host icon from its live NS records
+    # (Cloudflare-portal domains show the Cloudflare logo) and EXPANDS to its live SPF/DKIM/DMARC posture
+    # (Get-DomainDeliverability): a green ring when all three are healthy, a red outline when any is
+    # missing/broken. The panel's destination icon opens the domain's DNS where we manage it: a Cloudflare
+    # icon -> that zone's DNS in the Cloudflare dashboard for portal domains, else an IT Glue icon -> the
+    # domain's IT Glue record (or the org's DNS / Registrar asset list when no record matches).
+    # Returns @() (no band) when M365 isn't resolved or there are no mail-enabled domains.
     param([pscustomobject]$CippTenant, [string]$OrgId, [string]$LinkBase)
     if (-not ($CippTenant -and $CippTenant.Domain)) { return @() }
 
     $domains = @()
     try {
         $domains = @(Invoke-CippGraph -TenantFilter $CippTenant.Domain -Endpoint 'domains') |
-                   Where-Object { $_.isVerified -and -not $_.isInitial -and "$($_.id)" -notmatch '(?i)\.onmicrosoft\.com$' }
+                   Where-Object { $_.isVerified -and -not $_.isInitial -and "$($_.id)" -notmatch '(?i)\.onmicrosoft\.com$' -and ($_.supportedServices -contains 'Email') }
     } catch { Write-Status "  CIPP domains query failed: $($_.Exception.Message)" Warning; return @() }
     if (-not $domains) { return @() }
 
@@ -1618,17 +1863,21 @@ function Get-M365DomainItems {
         @{ Expression = { if ("$($_.id)".ToLowerInvariant() -eq $defaultDomain) { 0 } else { 1 } } }, `
         @{ Expression = { "$($_.id)" } }
 
-    $adminBase = 'https://admin.microsoft.com/#/Domains/Details'
     $cfPortal = Get-CloudflarePortalSet   # lazily loads (once per run) the Cloudflare zone set on first use
     $pills = @()
     foreach ($d in $sorted) {
         $name = "$($d.id)"
         $low  = $name.ToLowerInvariant()
-        $link = if ($itgById.ContainsKey($low)) { "$LinkBase/domains/$($itgById[$low])" } else { "$adminBase/$name" }
-        # M365 default domain -> green outline ring, keeping the pill's normal styling/icon.
-        $ring = if ($defaultDomain -and $low -eq $defaultDomain) { '#28A745' } else { '' }
-        # Icon: Cloudflare logo for domains on OUR portal cluster, else the DNS-host icon mapped from the
-        # live NS records (IT Glue logo as a last resort so every pill still has an icon).
+        # Destination icons. Always include an IT Glue link to where the domain's DNS is documented: its IT
+        # Glue domain record when one matches, else the org's DNS / Registrar asset list. A domain on OUR
+        # Cloudflare portal ALSO gets a Cloudflare icon (shown first) opening that zone's DNS records in the
+        # Cloudflare dashboard; the portal map gives the zone's account id (clients sit in separate accounts).
+        $itgUrl = if ($itgById.ContainsKey($low)) { "$LinkBase/domains/$($itgById[$low])" } else { "$LinkBase/assets/304026-dns-registrar/records" }
+        $actions = @()
+        if ($cfPortal[$low]) { $actions += New-Action -Dest 'cloudflare' -Url "https://dash.cloudflare.com/$($cfPortal[$low])/$low/dns/records" }
+        $actions += New-Action -Dest 'itglue' -Url $itgUrl
+        # Pill brand (left logo): Cloudflare for portal domains, else the DNS-host icon mapped from the live
+        # NS records (IT Glue logo as a last resort so every pill still has an icon).
         $brand = ''
         if ($cfPortal[$low]) {
             $brand = 'cloudflare.com'
@@ -1640,10 +1889,23 @@ function Get-M365DomainItems {
             } catch { }
             if (-not $brand) { $brand = 'itglue.com' }
         }
-        $pills += New-CardItem -Label $name -Link $link -Brand $brand -Ring $ring
+        # Live email-auth posture -> expandable detail. Green ring when SPF+DKIM+DMARC all healthy, else a
+        # red outline (-Alert). The default domain is the first pill (sort order above), so its position
+        # carries that signal; the ring/outline is reserved for deliverability health.
+        $del = Get-DomainDeliverability -Domain $name
+        # SPF/DMARC are long TXT records -> list each token on its own (word-breaking) line so they don't
+        # spill the panel; SPF splits on whitespace, DMARC on ';'. DKIM is a short Published/Partial/Not
+        # published verdict. The box is already titled 'Deliverability', so no per-pill DetailHead.
+        $detail = @()
+        $detail += New-DnsRecordRows -Label 'SPF' -Value $del.Spf -State $del.SpfState -Present ($del.Spf -match '^(?i)v=spf1')
+        $detail += New-DetailRow -K 'DKIM' -V $del.Dkim -State $del.DkimState
+        $detail += New-DnsRecordRows -Label 'DMARC' -Value $del.Dmarc -State $del.DmarcState -Present ($del.Dmarc -match '^(?i)v=DMARC1') -Split ';'
+        $ring = if ($del.AllOk) { '#28A745' } else { '' }
+        $pills += New-CardItem -Label $name -Actions $actions -Brand $brand `
+                               -Detail $detail -Ring $ring -Alert:(-not $del.AllOk)
     }
     if ($pills.Count -eq 0) { return @() }
-    return New-CardGroup -Label 'Domains' -Items $pills
+    return New-CardGroup -Label 'Deliverability' -Items $pills
 }
 
 function Get-CippMailboxItem {
@@ -1685,10 +1947,10 @@ function Get-CippMailboxItem {
 }
 
 function Get-DashM365 {
-    # 'Email' card: M365 license pills (live CIPP/GDAP, IT Glue fallback) plus the org's verified
-    # custom M365 domains (Get-M365DomainItems). The licenses go in an explicit 'Microsoft 365' band
-    # and the card is built -NoBand so the flat domain pills below aren't auto-grouped by their
-    # DNS-host brand. (MFA enforcement + AD-sync live on the Identity card.)
+    # 'Email' card: M365 license pills (live CIPP/GDAP, IT Glue fallback) plus a Deliverability band of
+    # the org's mail-enabled custom M365 domains and their SPF/DKIM/DMARC posture (Get-DeliverabilityItems).
+    # The licenses go in an explicit 'Microsoft 365' band and the card is built -NoBand so the
+    # Deliverability band keeps its own grouping. (MFA enforcement + AD-sync live on the Identity card.)
     param([pscustomobject]$Entry, [string]$OrgId, [string]$LinkBase, [pscustomobject]$CippTenant, [pscustomobject]$MswTenant)
     # Per-SKU license records {Name; Used; Total; Link; Over}, rolled up below into ONE summary pill.
     $licenseRecs = @()
@@ -1748,9 +2010,9 @@ function Get-DashM365 {
         $detail = @($licenseRecs | Sort-Object Name | ForEach-Object {
             $v = if ($null -ne $_.Used -and $null -ne $_.Total) { "$($_.Used)/$($_.Total)" }
                  elseif ($null -ne $_.Used) { "$($_.Used)" } else { '' }
-            New-DetailRow -K $_.Name -V $v -State $(if ($_.Over) { 'bad' } else { '' }) -Link $_.Link
+            New-DetailRow -K $_.Name -V $v -State $(if ($_.Over) { 'bad' } else { '' }) -Actions @(New-Action -Dest 'itglue' -Url $_.Link)
         })
-        $licenseItem = New-CardItem -Label "$assigned/$totalLic licenses assigned" -Brand 'microsoft.com' -Detail $detail -DetailHead 'Licenses' -Alert:$anyOver
+        $licenseItem = New-CardItem -Label "$assigned/$totalLic licenses assigned" -Brand 'microsoft.com' -Detail $detail -Alert:$anyOver
     }
 
     $items = @()
@@ -1771,7 +2033,7 @@ function Get-DashM365 {
             $items += New-CardGroup -Label 'Cloud App Security' -Brand 'cloudappsecurity' -Items @(New-CardItem -Label "$casCount users")
         }
     }
-    $items += @(Get-M365DomainItems -CippTenant $CippTenant -OrgId $OrgId -LinkBase $LinkBase)
+    $items += @(Get-DeliverabilityItems -CippTenant $CippTenant -OrgId $OrgId -LinkBase $LinkBase)
     return New-Card -Title 'Email' -Items $items -NoBand
 }
 
@@ -1839,7 +2101,7 @@ function Get-DashUsers {
             try { $billId = (Get-CWMCompany -id $co.Id).billingContact.id } catch {}
             $cwHref = if ($billId) { "$base`?recordType=ContactFV&recid=$billId" } else { "$base`?recordType=CompanyFV&recid=$($co.Id)" }
             $cwLabel = if ($null -ne $cw) { "$cw contacts" } else { "n/a contacts" }
-            $cwmItems += New-CardItem -Label $cwLabel -Link $cwHref -Brand 'connectwise.com'
+            $cwmItems += New-CardItem -Label $cwLabel -Actions @(New-Action -Dest 'connectwise' -Url $cwHref) -Brand 'connectwise.com'
 
             # Multiple CWM pills -> cluster them in a 'ConnectWise Manage' sub-box (same pattern as the
             # Veeam / Microsoft 365 groups); a single pill stays inline.
@@ -1850,7 +2112,7 @@ function Get-DashUsers {
     # IT Glue contacts (no active/inactive concept in IT Glue -> total contacts for the org).
     $itg = Get-ItgContactCount -OrgId $OrgId
     $itgLabel = if ($null -ne $itg) { "$itg contacts" } else { "n/a contacts" }
-    $items += New-CardItem -Label $itgLabel -Link "$LinkBase/contacts" -Brand 'itglue.com'
+    $items += New-CardItem -Label $itgLabel -Actions @(New-Action -Dest 'itglue' -Url "$LinkBase/contacts") -Brand 'itglue.com'
 
     return New-Card -Title 'Users' -Items $items
 }
@@ -1884,7 +2146,18 @@ function Resolve-AutomateClient {
         $cond  = "Name contains '$($token -replace "'","''")'"
         $cands = @(Invoke-RestMethod -Uri "$($script:AutomateUrl)/cwa/api/v1/clients?condition=$([uri]::EscapeDataString($cond))&pagesize=200" -Headers $script:AutomateHeaders)
     } catch { Write-Status "  Automate client query failed: $($_.Exception.Message)" Warning }
-    $m = $cands | Where-Object { (ConvertTo-NormalizedName $_.Name) -eq $target } | Select-Object -First 1
+    # The Automate clients endpoint sometimes returns a single AGGREGATED row whose Id/Name are parallel
+    # column-ARRAYS (one element per matched client) instead of one row object per client. Flatten both
+    # shapes into scalar {Id; Name} pairs, so the normalized match sees each client name on its own - on
+    # the aggregated row, "$_.Name" is the whole array stringified, which never matches and silently drops
+    # the client's Automate band (and its device deep-links).
+    $pairs = New-Object System.Collections.Generic.List[object]
+    foreach ($c in $cands) {
+        $names = @($c.Name); $ids = @($c.Id)
+        if ($names.Count -le 1) { $pairs.Add([pscustomobject]@{ Id = "$($c.Id)"; Name = "$($c.Name)" }) }
+        else { for ($i = 0; $i -lt $names.Count; $i++) { $pairs.Add([pscustomobject]@{ Id = "$($ids[$i])"; Name = "$($names[$i])" }) } }
+    }
+    $m = $pairs | Where-Object { (ConvertTo-NormalizedName $_.Name) -eq $target } | Select-Object -First 1
     if (-not $m) { return $null }
     $val = [pscustomobject]@{ Id = "$($m.Id)"; Name = $m.Name }
     $Entry | Add-Member -NotePropertyName 'automate' -NotePropertyValue $val -Force
@@ -1892,10 +2165,21 @@ function Resolve-AutomateClient {
     return $val.Id
 }
 
+function Get-AutomateControlLink {
+    # ConnectWise Automate "Take Control" launcher for a computer: redirects through the ScreenConnect
+    # plugin extension straight into the Control (ScreenConnect) session, so a tech already signed in to
+    # Automate lands in the remote session without a separate ScreenConnect login. This is the exact URL
+    # CW Manage's "Remote" button fires (stored on each Automate-managed CWM config as remoteLink). The
+    # plugin GUID + action GUID are global to the Automate instance - verified constant across every
+    # client's configs - so only the computer id varies and the link can be built locally.
+    param([string]$CompId)
+    "$($script:AutomateUrl)/automate/extension-redirect/77d4bab8-294b-11e9-b491-120af8af1412?i=$CompId&a=A039C02E-4199-4FE6-B658-E40468B8ADE8&"
+}
+
 function Get-AutomateDcItem {
     # On-prem AD pill(s): one pill per local AD domain (e.g. "sscv.local"), each EXPANDING to list that
-    # domain's domain controllers. Each DC in the panel is a clickable link straight to its own page in
-    # ConnectWise Automate. ConnectWise Automate tags a domain controller by prefixing its agent
+    # domain's domain controllers. Each DC in the panel is a Take Control link that launches its
+    # ScreenConnect session (a DC is a server). ConnectWise Automate tags a domain controller by prefixing its agent
     # DomainName with 'DC:' (members show the bare domain, e.g. 'DC:sscv.local' vs 'sscv.local'), so DCs
     # are the computers whose DomainName starts with 'DC:' and the domain is that value with the prefix
     # stripped. Returns an array of pills (one per domain), or $null when no Automate match / no DC.
@@ -1912,8 +2196,9 @@ function Get-AutomateDcItem {
     $dcs = @($comps | Where-Object { "$($_.DomainName)" -match '^DC:' })
     if ($dcs.Count -eq 0) { return $null }
 
-    # Group the DCs by their AD domain (most clients have one; handle multiple defensively). Each DC links
-    # to its own Automate computer page (browse SPA) so a tech lands on that device, not the company list.
+    # Group the DCs by their AD domain (most clients have one; handle multiple defensively). A DC is a
+    # server, so each DC name is a Take Control link that launches its ScreenConnect session (same as the
+    # Servers pill), not a link to the Automate page.
     $byDomain = @{}
     foreach ($dc in $dcs) {
         $d = ($dc.DomainName -replace '^DC:', '').Trim()
@@ -1921,16 +2206,53 @@ function Get-AutomateDcItem {
         if (-not $byDomain.ContainsKey($d)) { $byDomain[$d] = New-Object System.Collections.Generic.List[object] }
         $byDomain[$d].Add($dc)
     }
-    $compLink = "$($script:AutomateUrl)/automate/browse/companies/computers?companyId=$autoId"
     $pills = @()
     foreach ($d in ($byDomain.Keys | Sort-Object)) {
-        $rows = @(New-DetailRow -K 'Domain controllers' -V "$($byDomain[$d].Count)") + @($byDomain[$d] |
+        # No box-level "Open in Automate" link: each DC row below is already a direct Take Control link,
+        # so a company-level link would be redundant.
+        $dcKey = if ($byDomain[$d].Count -eq 1) { 'Domain controller' } else { 'Domain controllers' }
+        $rows = @(New-DetailRow -K $dcKey -V "$($byDomain[$d].Count)") + @($byDomain[$d] |
             Sort-Object { "$($_.ComputerName)" } |
-            ForEach-Object { New-DetailRow -V "$($_.ComputerName)" -Link "$($script:AutomateUrl)/automate/browse/computers/$($_.Id)" })
-        $pills += New-CardItem -Label $d -Brand 'winserver' -Muted `
-            -Detail $rows -Link $compLink -LinkText 'Open in Automate'
+            ForEach-Object { New-DetailRow -V "$($_.ComputerName)" -Actions @(New-Action -Dest 'screenconnect' -Url (Get-AutomateControlLink -CompId "$($_.Id)")) })
+        $pills += New-CardItem -Label $d -Brand 'winserver' -Muted -Detail $rows
     }
     return $pills
+}
+
+function Get-AutomateSyncServers {
+    # The server(s) running the Microsoft Entra Connect / Azure AD Connect sync agent, found via Automate
+    # software inventory (the cloud side doesn't reliably expose this - see Get-CippSyncItem). Returns an
+    # array of {Id; Name} computers (usually one; a staging setup has two), or @() when there's no Automate
+    # match / agent. Sourced like the Duo-logon pill: the software endpoint takes a flat condition carrying
+    # ClientId + ComputerId per row, so we filter by client and product name in one call.
+    #   - 'Connect Sync' matches the sync ENGINE under both names ("Microsoft Entra Connect Sync",
+    #     "Microsoft Azure AD Connect sync") while excluding the co-installed "...Connect Health Agent" and
+    #     "...Connect Agent Updater" (which can also live on DCs), so we don't mis-tag a non-sync server.
+    #   - 'Provisioning Agent' matches Entra Connect *cloud sync* (no engine, just the provisioning agent).
+    param([pscustomobject]$Entry, [string]$OrgName)
+    if (-not $script:AutomateConnected) { return @() }
+    $autoId = Resolve-AutomateClient -Entry $Entry -OrgName $OrgName
+    if (-not $autoId) { return @() }
+    try {
+        $swCond = "ClientId = $autoId and (Name contains 'Connect Sync' or Name contains 'Provisioning Agent')"
+        $rawSw  = Invoke-RestMethod -Uri "$($script:AutomateUrl)/cwa/api/v1/Computers/Software?condition=$([uri]::EscapeDataString($swCond))&pagesize=1000" -Headers $script:AutomateHeaders
+    } catch { Write-Status "  Automate sync-server query failed: $($_.Exception.Message)" Warning; return @() }
+    $sw = New-Object System.Collections.Generic.List[object]
+    foreach ($x in $rawSw) { if ($x -is [array]) { $sw.AddRange($x) } else { $sw.Add($x) } }
+    $hostIds = @($sw | ForEach-Object { "$($_.ComputerId)" } | Where-Object { $_ } | Sort-Object -Unique)
+    if ($hostIds.Count -eq 0) { return @() }
+
+    # Software rows carry only ComputerId; pull the client's computers to resolve each id to its name (same
+    # call shape as Get-AutomateDcItem) so the detail row can name + link the host.
+    try {
+        $cond = "Client.Id = $autoId"
+        $raw  = Invoke-RestMethod -Uri "$($script:AutomateUrl)/cwa/api/v1/computers?condition=$([uri]::EscapeDataString($cond))&pagesize=1000" -Headers $script:AutomateHeaders
+    } catch { Write-Status "  Automate sync-server computers query failed: $($_.Exception.Message)" Warning; return @() }
+    $comps = New-Object System.Collections.Generic.List[object]
+    foreach ($x in $raw) { if ($x -is [array]) { $comps.AddRange($x) } else { $comps.Add($x) } }
+    return @($comps | Where-Object { $hostIds -contains "$($_.Id)" } |
+        ForEach-Object { [pscustomobject]@{ Id = "$($_.Id)"; Name = "$($_.ComputerName)" } } |
+        Sort-Object Name)
 }
 
 function Get-AutomateDuoLogonItem {
@@ -1978,8 +2300,87 @@ function Get-AutomateDuoLogonItem {
     $detail = @(New-DetailRow -K 'Missing Duo Logon agent' -V "$($missing.Count)") + @($missing | ForEach-Object { New-DetailRow -V $_ })
 
     $link = "$($script:AutomateUrl)/automate/browse/companies/computers?companyId=$autoId"
-    return New-CardItem -Label "Duo Logon: $covered of $total devices" -Link $link -LinkText 'Open in Automate' `
+    return New-CardItem -Label "Duo Logon: $covered/$total devices" -Actions @(New-Action -Dest 'automate' -Url $link) `
         -Detail $detail -Brand 'duo.com' -Alert:($covered -lt $total)
+}
+
+function Compare-DuoVersion {
+    # Compare two dotted version strings (e.g. '6.6.0' vs '6.5.2'); returns -1 / 0 / 1. Non-numeric chars
+    # are stripped first (the proxy's Version field is clean, but this keeps it robust); a blank/unparseable
+    # version sorts lowest. Used to rank Duo Auth Proxy builds without a hardcoded "latest".
+    param([string]$A, [string]$B)
+    $va = $null; $vb = $null
+    [void][version]::TryParse(("$A" -replace '[^\d.]',''), [ref]$va)
+    [void][version]::TryParse(("$B" -replace '[^\d.]',''), [ref]$vb)
+    if (-not $va -and -not $vb) { return 0 }
+    if (-not $va) { return -1 }
+    if (-not $vb) { return 1 }
+    return $va.CompareTo($vb)
+}
+
+function Get-DuoProxyLatest {
+    # The newest Duo Authentication Proxy version present ANYWHERE in this Automate instance, used as the
+    # "latest" baseline for the per-client Auth Proxy pill - a self-updating reference so there's no
+    # hardcoded version to maintain (Duo's API doesn't expose the proxy build that's installed, and there's
+    # no public "latest version" endpoint to query). Cached for the run. Returns '' if none / Automate down.
+    if ($null -ne $script:DuoProxyLatest) { return $script:DuoProxyLatest }
+    $script:DuoProxyLatest = ''
+    if (-not $script:AutomateConnected) { return '' }
+    try {
+        $cond = "Name contains 'Duo Security Authentication Proxy'"
+        $raw  = Invoke-RestMethod -Uri "$($script:AutomateUrl)/cwa/api/v1/Computers/Software?condition=$([uri]::EscapeDataString($cond))&pagesize=1000" -Headers $script:AutomateHeaders
+    } catch { Write-Status "  Automate Duo-proxy latest-version query failed: $($_.Exception.Message)" Warning; return '' }
+    $sw = New-Object System.Collections.Generic.List[object]
+    foreach ($x in $raw) { if ($x -is [array]) { $sw.AddRange($x) } else { $sw.Add($x) } }
+    $best = ''
+    foreach ($r in $sw) { if ((Compare-DuoVersion "$($r.Version)" $best) -gt 0) { $best = "$($r.Version)" } }
+    $script:DuoProxyLatest = $best
+    return $best
+}
+
+function Get-AutomateDuoProxyItem {
+    # Endpoint-Security pill: tracks the Duo Authentication Proxy (the on-prem RADIUS/LDAP broker that adds
+    # MFA to VPNs, RADIUS, LDAP apps, AD FS, etc.). Sourced from ConnectWise Automate software inventory
+    # because Duo's own API doesn't report which servers run the proxy. It installs as
+    # "Duo Security Authentication Proxy <version>" with a clean Version field (note: this does NOT collide
+    # with the "Duo Authentication for Windows Logon" agent the Duo Logon pill counts - different string).
+    # The pill gets a red ring when any install is behind the latest build seen across the fleet
+    # (Get-DuoProxyLatest); clicking it lists each computer and its version, outdated ones flagged red.
+    # Returns $null when the client has no proxy installed anywhere (no pill).
+    param([pscustomobject]$Entry, [string]$OrgName)
+    $autoId = Resolve-AutomateClient -Entry $Entry -OrgName $OrgName
+    if (-not $autoId) { return $null }
+
+    try {
+        $swCond = "ClientId = $autoId and Name contains 'Duo Security Authentication Proxy'"
+        $rawSw  = Invoke-RestMethod -Uri "$($script:AutomateUrl)/cwa/api/v1/Computers/Software?condition=$([uri]::EscapeDataString($swCond))&pagesize=1000" -Headers $script:AutomateHeaders
+    } catch { Write-Status "  Automate Duo-proxy software query failed: $($_.Exception.Message)" Warning; return $null }
+    $sw = New-Object System.Collections.Generic.List[object]
+    foreach ($x in $rawSw) { if ($x -is [array]) { $sw.AddRange($x) } else { $sw.Add($x) } }
+    if ($sw.Count -eq 0) { return $null }
+
+    $latest = Get-DuoProxyLatest
+
+    # One install per computer (defensive de-dup by ComputerId, keeping the highest version).
+    $byComp = @{}
+    foreach ($r in $sw) {
+        $cid = "$($r.ComputerId)"; if (-not $cid) { continue }
+        if ((-not $byComp.ContainsKey($cid)) -or ((Compare-DuoVersion "$($r.Version)" "$($byComp[$cid].Version)") -gt 0)) { $byComp[$cid] = $r }
+    }
+    $installs = @($byComp.Values | Sort-Object { "$($_.ComputerName)" })
+    $outdated = @($installs | Where-Object { $latest -and ((Compare-DuoVersion "$($_.Version)" $latest) -lt 0) })
+
+    $rows = @()
+    if ($latest) { $rows += New-DetailRow -K 'Latest version' -V $latest }
+    $rows += @($installs | ForEach-Object {
+        $stale = $latest -and ((Compare-DuoVersion "$($_.Version)" $latest) -lt 0)
+        New-DetailRow -K "$($_.ComputerName)" -V "$($_.Version)" -State $(if ($stale) { 'bad' } else { 'ok' }) `
+            -Actions @(New-Action -Dest 'automate' -Url "$($script:AutomateUrl)/automate/computer/$($_.ComputerId)")
+    })
+
+    $link = "$($script:AutomateUrl)/automate/browse/companies/computers?companyId=$autoId"
+    return New-CardItem -Label "Auth Proxy: $(Format-CountNoun $installs.Count 'device')" `
+        -Actions @(New-Action -Dest 'automate' -Url $link) -Detail $rows -Brand 'duo.com' -Alert:($outdated.Count -gt 0)
 }
 
 function Get-ConfigCountPill {
@@ -1998,8 +2399,9 @@ function Get-ConfigCountPill {
     if (-not $Link) {
         # Fallback: IT Glue UI filter deep-link (#partial=...&filters=[Type:<name>]).
         $link = "$LinkBase/configurations#partial=&sortBy=name:asc&filters=%5BType:$([Uri]::EscapeDataString($TypeName))%5D"
-    } else { $link = $Link }
-    return New-CardItem -Label "$([int]$count) $noun" -Link $link -Brand $Brand -Muted
+        $dest = 'itglue'
+    } else { $link = $Link; $dest = 'automate' }
+    return New-CardItem -Label "$(Format-CountNoun ([int]$count) ($noun -replace 's$',''))" -Actions @(New-Action -Dest $dest -Url $link) -Brand $Brand -Muted
 }
 
 function Get-AutomateComputerSet {
@@ -2045,22 +2447,6 @@ function Format-Age {
     return "$([math]::Max(1,[int][math]::Floor($Span.TotalMinutes)))m"
 }
 
-function Get-AutomateDriveUsage {
-    # Used/total GB across a computer's non-removable (internal, present) drives, via the drives endpoint.
-    # Sizes come back in MB. Returns @{ UsedGB; TotalGB } or $null when the call fails / no internal drive.
-    param([string]$CompId)
-    try {
-        $raw = Invoke-RestMethod -Uri "$($script:AutomateUrl)/cwa/api/v1/computers/$CompId/drives" -Headers $script:AutomateHeaders
-    } catch { return $null }
-    $drv = New-Object System.Collections.Generic.List[object]
-    foreach ($x in $raw) { if ($x -is [array]) { $drv.AddRange($x) } else { $drv.Add($x) } }
-    $internal = @($drv | Where-Object { ("$($_.IsInternal)" -eq 'True') -and ("$($_.IsMissing)" -ne 'True') -and ([double]("0" + "$($_.Size)") -gt 0) })
-    if ($internal.Count -eq 0) { return $null }
-    $sizeMb = ($internal | Measure-Object -Property Size -Sum).Sum
-    $freeMb = ($internal | Measure-Object -Property FreeSpace -Sum).Sum
-    return @{ UsedGB = [int][math]::Round(($sizeMb - $freeMb) / 1024); TotalGB = [int][math]::Round($sizeMb / 1024) }
-}
-
 function Get-AutomateWorkstationPill {
     # Workstations pill, Automate-sourced: "<n> workstations" and, when any haven't checked in for
     # $script:StaleDays, a "· <s> stale" tail with a red ring. Expands to the stale device names, each a
@@ -2070,49 +2456,48 @@ function Get-AutomateWorkstationPill {
     if ($ws.Count -eq 0) { return $null }
     $cutoff = (Get-Date).AddDays(-$script:StaleDays)
     $stale  = @($ws | Where-Object { $lc = Get-CompLastContact $_; (-not $lc) -or ($lc -lt $cutoff) })
-    $label  = if ($stale.Count -gt 0) { "$($ws.Count) workstations · $($stale.Count) stale" } else { "$($ws.Count) workstations" }
+    $label  = if ($stale.Count -gt 0) { "$(Format-CountNoun $ws.Count 'workstation') · $($stale.Count) stale" } else { Format-CountNoun $ws.Count 'workstation' }
     if ($stale.Count -eq 0) {
-        return New-CardItem -Label $label -Link $AutoLink -LinkText 'Open in Automate' -Brand 'automate' -Muted
+        return New-CardItem -Label $label -Actions @(New-Action -Dest 'automate' -Url $AutoLink) -Brand 'automate' -Muted
     }
     $rows = @(New-DetailRow -K "Stale (>$($script:StaleDays)d)" -V "$($stale.Count)") + @($stale |
         Sort-Object { Get-CompLastContact $_ } |
         ForEach-Object {
             $lc = Get-CompLastContact $_
             $age = if ($lc) { Format-Age ((Get-Date) - $lc) } else { 'never' }
-            New-DetailRow -V "$($_.ComputerName) ($age)" -Link "$($script:AutomateUrl)/automate/browse/computers/$($_.Id)" })
+            New-DetailRow -V "$($_.ComputerName) ($age)" -Actions @(New-Action -Dest 'automate' -Url "$($script:AutomateUrl)/automate/computer/$($_.Id)") })
     # Amber (warning) ring, not red: a stale workstation is softer than an offline server (which gets the
     # red error ring), so the two read as distinct severities at a glance.
     return New-CardItem -Label $label -Brand 'automate' -Ring '#E0A800' `
-        -Detail $rows -Link $AutoLink -LinkText 'Open in Automate'
+        -Detail $rows -Actions @(New-Action -Dest 'automate' -Url $AutoLink)
 }
 
 function Get-AutomateServerPill {
     # Servers pill, Automate-sourced: "<n> servers" with a red ring (and "· <o> offline" tail) when any
-    # server is offline. Expands to every server with its used/total GB across non-removable drives; an
-    # offline server shows how long it's been offline (red) instead. Each row links to the machine's
-    # Automate page. Returns $null when the client has no Automate servers.
+    # server is offline. Expands to a plain list of every server; each server name is a "Take Control"
+    # link that launches the machine's ScreenConnect session via Automate, and an offline server's name
+    # is tailed with how long it's been offline. Returns $null when the client has no Automate servers.
     param([object[]]$Comps, [string]$AutoLink)
     $sv = @($Comps | Where-Object { "$($_.Type)" -eq 'Server' })
     if ($sv.Count -eq 0) { return $null }
     $offline = @($sv | Where-Object { "$($_.Status)" -ne 'Online' })
-    $label = if ($offline.Count -gt 0) { "$($sv.Count) servers · $($offline.Count) offline" } else { "$($sv.Count) servers" }
+    $label = if ($offline.Count -gt 0) { "$(Format-CountNoun $sv.Count 'server') · $($offline.Count) offline" } else { Format-CountNoun $sv.Count 'server' }
     $rows = @($sv |
         Sort-Object { "$($_.ComputerName)" } |
         ForEach-Object {
-            $isOff = "$($_.Status)" -ne 'Online'
-            $link  = "$($script:AutomateUrl)/automate/browse/computers/$($_.Id)"
-            if ($isOff) {
+            $scLink = Get-AutomateControlLink -CompId "$($_.Id)"
+            $name = "$($_.ComputerName)"
+            if ("$($_.Status)" -ne 'Online') {
                 $lc = Get-CompLastContact $_
-                $v  = if ($lc) { "offline $(Format-Age ((Get-Date) - $lc))" } else { 'offline' }
-                New-DetailRow -K "$($_.ComputerName)" -V $v -State 'bad' -Link $link
-            } else {
-                $u = Get-AutomateDriveUsage -CompId "$($_.Id)"
-                $v = if ($u) { "$($u.UsedGB) / $($u.TotalGB) GB" } else { 'n/a' }
-                New-DetailRow -K "$($_.ComputerName)" -V $v -Link $link
+                $name += if ($lc) { " · offline $(Format-Age ((Get-Date) - $lc))" } else { ' · offline' }
             }
+            # ScreenConnect (Take Control) + Automate (the machine's Automate page). Servers only -
+            # DC and Sync-server rows keep their single ScreenConnect icon.
+            New-DetailRow -V $name -Actions @(
+                New-Action -Dest 'screenconnect' -Url $scLink
+                New-Action -Dest 'automate' -Url "$($script:AutomateUrl)/automate/computer/$($_.Id)")
         })
-    return New-CardItem -Label $label -Brand 'automate' -Alert:($offline.Count -gt 0) `
-        -Detail $rows -DetailHead 'Servers' -Link $AutoLink -LinkText 'Open in Automate'
+    return New-CardItem -Label $label -Brand 'automate' -Alert:($offline.Count -gt 0) -Detail $rows
 }
 
 function Get-DashDevices {
@@ -2459,7 +2844,7 @@ function New-WanIpRows {
         $disp = if ($showPort) { "$($w.Ip):$($w.Port)" } else { $w.Ip }
         $url  = if ($showPort) { "https://$($w.Ip):$($w.Port)" } else { "https://$($w.Ip)" }
         $label = if ($k -eq 0) { 'WAN IP' } else { "WAN IP $($k + 1)" }
-        $rows += New-DetailRow $label $disp -Link $url
+        $rows += New-DetailRow $label $disp -Link $url -NoUnderline
     }
     return $rows
 }
@@ -2502,6 +2887,109 @@ function Get-FirewallCredentialUrl {
     return "$LinkBase/configurations/$($Config.id)"
 }
 
+# UniFi gateway shortname -> friendly firewall model (the cloud API reports the gateway only by its
+# shortname; we also resolve the exact model from the gateway's globally-unique MAC when possible).
+$script:UnifiGatewayNames = @{
+    'UDMPRO'='Dream Machine Pro'; 'UDMPROMAX'='Dream Machine Pro Max'; 'UDMPROSE'='Dream Machine SE'
+    'UDMSE'='Dream Machine SE'; 'UDM'='Dream Machine'; 'UDMB'='Dream Machine'
+    'UDR'='Dream Router'; 'UDR7'='Dream Router 7'; 'UDW'='Dream Wall'; 'UDWPRO'='Dream Wall Pro'
+    'UXG'='Next-Gen Gateway'; 'UXGPRO'='Next-Gen Gateway Pro'; 'UXGLITE'='Cloud Gateway Lite'
+    'UCG'='Cloud Gateway'; 'UCGULTRA'='Cloud Gateway Ultra'; 'UCGMAX'='Cloud Gateway Max'; 'UCGFIBER'='Cloud Gateway Fiber'
+    'USG'='Security Gateway'; 'USG3P'='Security Gateway'; 'USGPRO4'='Security Gateway Pro 4'
+}
+
+# Shared controllers that host many DIFFERENT clients as separate sites. Never offer an "all sites on
+# controller" bundle for these - a bundle would sweep in other clients' sites. Pick per-site instead
+# (a client with 2 sites here just selects e.g. "1 2"). Matched case-insensitively against HostName.
+$script:UnifiSharedControllers = @('CBC Unifi')
+
+function Get-UnifiDeviceData {
+    # Fetch the whole managed-device fleet from the Site Manager API ONCE per run and index it. Devices
+    # are grouped by HOST and carry no siteId, so:
+    #   ByMac  (mac -> device) is reliable for ANY site - a MAC is globally unique (used to name the
+    #          gateway firewall from a site's meta.gatewayMac).
+    #   ByHost (hostId -> @(devices)) is only a reliable per-site view when a host runs a SINGLE site
+    #          (one MSP CloudKey here hosts 70 client sites); callers must gate on the site's SoloHost
+    #          flag before listing device names.
+    if ($script:UnifiDeviceData) { return $script:UnifiDeviceData }
+    $byMac = @{}; $byHost = @{}; $next = $null
+    do {
+        $uri = "$($script:UnifiBase)/v1/devices?pageSize=200"
+        if ($next) { $uri += "&nextToken=$([uri]::EscapeDataString($next))" }
+        $r = Invoke-RestMethod -Uri $uri -Headers $script:UnifiHeaders -Method Get
+        foreach ($g in $r.data) {
+            $hid = "$($g.hostId)"
+            if (-not $byHost.ContainsKey($hid)) { $byHost[$hid] = @() }
+            foreach ($d in $g.devices) {
+                $byHost[$hid] += $d
+                $mac = ("$($d.mac)" -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+                if ($mac) { $byMac[$mac] = $d }
+            }
+        }
+        $next = $r.nextToken
+    } while ($next)
+    $script:UnifiDeviceData = @{ ByMac = $byMac; ByHost = $byHost }
+    return $script:UnifiDeviceData
+}
+
+function Get-UnifiSsids {
+    # Real SSID names for a site, via the connector cloud bridge that proxies the console-local Network
+    # Integration API through Ubiquiti's cloud using our Site Manager X-API-KEY:
+    #   GET api.ui.com/v1/connector/consoles/{hostId}/network/integration/v1/sites
+    #   GET   .../sites/{netSiteId}/wifi/broadcasts
+    # The Site Manager site (this $Slug = its meta.name) joins to a connector site by internalReference.
+    # Only works when the console is online with a recent Network app (~fw >= 5.0.3) and the integration
+    # API responds; old/disconnected/unresponsive consoles (e.g. the big shared CloudKey, which 408s) are
+    # caught and return $null so the caller falls back to the SSID count. Per-host results are cached and
+    # a short timeout keeps a dead console from stalling the run.
+    param([string]$HostId, [string]$Slug)
+    if (-not $HostId) { return $null }
+    if (-not $script:UnifiSsidCache) { $script:UnifiSsidCache = @{} }
+    if (-not $script:UnifiSsidDeadHosts) { $script:UnifiSsidDeadHosts = @{} }
+    # The connector bridge is reachable (or not) per CONSOLE, not per site. Once a host's bridge has
+    # failed (403/offline/old fw), short-circuit every other site on it so we don't re-call and re-log.
+    if ($script:UnifiSsidDeadHosts.ContainsKey($HostId)) { return $null }
+    $ckey = "$HostId|$Slug"
+    if ($script:UnifiSsidCache.ContainsKey($ckey)) { return $script:UnifiSsidCache[$ckey] }
+
+    $base = "$($script:UnifiBase)/v1/connector/consoles/$HostId/network/integration/v1"
+    $result = $null
+    try {
+        # Resolve the connector site whose internalReference matches this Site Manager slug. Most consoles
+        # run a single 'default' site, so the first page is enough; page a little if not.
+        $netSiteId = $null; $offset = 0
+        do {
+            $sp = Invoke-RestMethod -Uri "$base/sites?offset=$offset&limit=50" -Headers $script:UnifiHeaders -Method Get -TimeoutSec 20
+            $pageData = @($sp.data)
+            $m = $pageData | Where-Object { "$($_.internalReference)" -eq "$Slug" } | Select-Object -First 1
+            if (-not $m -and $pageData.Count -eq 1 -and $offset -eq 0) { $m = $pageData[0] }  # single-site console
+            if ($m) { $netSiteId = "$($m.id)"; break }
+            $offset += 50
+        } while ($offset -lt [int]$sp.totalCount -and $offset -lt 250)
+
+        if ($netSiteId) {
+            $bp = Invoke-RestMethod -Uri "$base/sites/$netSiteId/wifi/broadcasts?limit=200" -Headers $script:UnifiHeaders -Method Get -TimeoutSec 20
+            $result = @($bp.data | ForEach-Object {
+                [pscustomobject]@{
+                    Name     = "$($_.name)"
+                    Enabled  = [bool]$_.enabled
+                    Security = "$($_.securityConfiguration.type)"
+                    Bands    = @($_.broadcastingFrequenciesGHz)
+                    Guest    = ("$($_.network.type)" -eq 'SPECIFIC')
+                }
+            })
+        }
+    } catch {
+        # Host-level failure (the bridge couldn't be reached at all) - mark the host dead so the other
+        # sites on it skip silently, and log just this once per host.
+        $script:UnifiSsidDeadHosts[$HostId] = $true
+        Write-Status "  UniFi SSID lookup unavailable for host $HostId (console offline/old/unresponsive): $($_.Exception.Message)" Detail
+        $result = $null
+    }
+    $script:UnifiSsidCache[$ckey] = $result
+    return $result
+}
+
 function Get-UnifiSites {
     # Site Manager cloud API: one candidate per site across every host the API key can see.
     #   Id      = siteId          (stable cache key)
@@ -2529,24 +3017,48 @@ function Get-UnifiSites {
         } while ($next)
     } catch { Write-Status "  UniFi hosts query failed: $($_.Exception.Message)" Warning }
 
-    $sites = @(); $next = $null
+    # Pull all sites first (each carries a rich per-site statistics block), then count how many sites
+    # share each host - device-name lists are only attributable to a site when its host runs just one.
+    $raw = @(); $next = $null
     do {
         $uri = "$($script:UnifiBase)/v1/sites?pageSize=200"
         if ($next) { $uri += "&nextToken=$([uri]::EscapeDataString($next))" }
         $r = Invoke-RestMethod -Uri $uri -Headers $script:UnifiHeaders -Method Get
-        foreach ($s in $r.data) {
-            $hi   = $hostInfo["$($s.hostId)"]
-            $desc = "$($s.meta.desc)".Trim()
-            $name = if ($desc -and $desc -ne 'Default') { $desc } elseif ($hi) { $hi.Name } else { '' }
-            if (-not $name) { $name = if ($desc) { $desc } else { "$($s.meta.name)" } }
-            $seg  = if ($hi -and $hi.PathSeg) { $hi.PathSeg } else { 'consoles' }
-            $sites += [pscustomobject]@{
-                Id = "$($s.siteId)"; Name = $name; Slug = "$($s.meta.name)"
-                HostId = "$($s.hostId)"; PathSeg = $seg; Provider = 'UniFi'
-            }
-        }
+        $raw += $r.data
         $next = $r.nextToken
     } while ($next)
+
+    $hostSiteCount = @{}
+    foreach ($s in $raw) { $h = "$($s.hostId)"; $hostSiteCount[$h] = 1 + [int]$hostSiteCount[$h] }
+
+    $sites = @()
+    foreach ($s in $raw) {
+        $hid  = "$($s.hostId)"
+        $hi   = $hostInfo[$hid]
+        $desc = "$($s.meta.desc)".Trim()
+        $name = if ($desc -and $desc -ne 'Default') { $desc } elseif ($hi) { $hi.Name } else { '' }
+        if (-not $name) { $name = if ($desc) { $desc } else { "$($s.meta.name)" } }
+        $seg  = if ($hi -and $hi.PathSeg) { $hi.PathSeg } else { 'consoles' }
+        $st   = $s.statistics
+        $cnt  = $st.counts
+        $sites += [pscustomobject]@{
+            Id = "$($s.siteId)"; Name = $name; Slug = "$($s.meta.name)"
+            HostId = $hid; PathSeg = $seg; Provider = 'UniFi'
+            HostName = if ($hi -and $hi.Name) { $hi.Name } else { '' }   # controller name (for multisite bundling)
+            # Per-site stats (accurate for every site, shared host or not):
+            GatewayMac   = ("$($s.meta.gatewayMac)" -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+            GatewayShort = "$($st.gateway.shortname)"
+            GatewayCount = [int]$cnt.gatewayDevice
+            WifiConfig   = [int]$cnt.wifiConfiguration
+            WifiDevice   = [int]$cnt.wifiDevice
+            WifiClient   = [int]$cnt.wifiClient
+            OfflineCount = [int]$cnt.offlineDevice
+            UpdateCount  = [int]$cnt.pendingUpdateDevice
+            WanIp        = "$($st.wans.WAN.externalIp)"
+            IspName      = "$($st.ispInfo.name)"
+            SoloHost     = ($hostSiteCount[$hid] -le 1)
+        }
+    }
     return $sites
 }
 
@@ -2569,8 +3081,9 @@ function Resolve-UnifiSites {
 
     # Fuzzy rank: strip a trailing ' - <suffix>', normalize, score by exact/prefix match + shared tokens.
     $target = ConvertTo-NormalizedName $OrgName
-    $scored = @($Sites | ForEach-Object {
-        $base = ($_.Name -replace '\s*-\s*[^-]+$', '')
+    $scoreName = {
+        param([string]$Name)
+        $base = ($Name -replace '\s*-\s*[^-]+$', '')
         $n    = ConvertTo-NormalizedName $base
         $score = 0
         if ($n) {
@@ -2578,15 +3091,38 @@ function Resolve-UnifiSites {
             elseif ($target -like "$n*" -or $n -like "$target*") { $score += 100 }
         }
         $score += @(($target -split ' ') | Where-Object { $_ -and (($n -split ' ') -contains $_) }).Count
-        [pscustomobject]@{ Site = $_; Score = $score }
-    } | Sort-Object -Property Score -Descending)
+        $score
+    }
+
+    # Build the pick-list. Each option resolves to one or more sites:
+    #   - 'controller' bundle: every site on a host that has >1 visible site, so a dedicated multisite
+    #     controller (e.g. one client with many sites) can be mapped in a single pick. (Shared hosts run
+    #     several clients as separate sites, so the bundle is offered, not auto-applied - pick per-site there.)
+    #   - 'site': an individual site (always offered, for shared hosts or finer control).
+    $options = @()
+    foreach ($g in @($Sites | Group-Object HostId)) {
+        if ($g.Count -le 1) { continue }
+        $hn = @($g.Group | ForEach-Object { $_.HostName } | Where-Object { $_ } | Select-Object -First 1)
+        $hn = if ($hn) { "$hn" } else { 'controller' }
+        if ($script:UnifiSharedControllers -contains $hn) { continue }   # shared controller: per-site picks only
+        $memberBest = @($g.Group | ForEach-Object { & $scoreName $_.Name } | Measure-Object -Maximum).Maximum
+        $options += [pscustomobject]@{
+            Display = "controller '$hn' - all $($g.Count) sites"
+            Sites   = @($g.Group)
+            Score   = [Math]::Max((& $scoreName $hn), [int]$memberBest)
+        }
+    }
+    foreach ($s in $Sites) {
+        $options += [pscustomobject]@{ Display = $s.Name; Sites = @($s); Score = (& $scoreName $s.Name) }
+    }
+    $scored = @($options | Sort-Object -Property Score -Descending)
 
     $showAll = $false
     while ($true) {
         $list = if ($showAll) { @($scored) } else { @($scored | Select-Object -First 12) }
-        Write-Host "`n  [UniFi] Select site(s) for '$OrgName' (e.g. 1,3 - multiple allowed):" -ForegroundColor Yellow
-        for ($i = 0; $i -lt $list.Count; $i++) { Write-Host ("    [{0}] {1}" -f ($i + 1), $list[$i].Site.Name) }
-        if (-not $showAll -and $scored.Count -gt $list.Count) { Write-Host "    [a] show ALL $($scored.Count) sites" }
+        Write-Host "`n  [UniFi] Select site(s)/controller for '$OrgName' (e.g. 1,3 - multiple allowed):" -ForegroundColor Yellow
+        for ($i = 0; $i -lt $list.Count; $i++) { Write-Host ("    [{0}] {1}" -f ($i + 1), $list[$i].Display) }
+        if (-not $showAll -and $scored.Count -gt $list.Count) { Write-Host "    [a] show ALL $($scored.Count) options" }
         Write-Host "    [0] none / not in UniFi"
         $sel = Read-Host "  Choice"
         if ($sel -match '^[Aa]$') { $showAll = $true; continue }
@@ -2596,7 +3132,7 @@ function Resolve-UnifiSites {
         $picked = @(); $bad = $false
         foreach ($t in $tokens) {
             $n = -1; [int]::TryParse($t, [ref]$n) | Out-Null
-            if ($n -ge 1 -and $n -le $list.Count) { $picked += $list[$n - 1].Site } else { $bad = $true }
+            if ($n -ge 1 -and $n -le $list.Count) { $picked += $list[$n - 1].Sites } else { $bad = $true }
         }
         if ($bad -or $picked.Count -eq 0) { Write-Host "  Invalid selection." -ForegroundColor Red; continue }
         $picked = @($picked | Sort-Object -Property Id -Unique)
@@ -2647,7 +3183,7 @@ function Get-DashNetwork {
                 }
                 $detail += @(New-WanIpRows -Config $cfg -Vendor 'sonicwall')
                 $credUrl = Get-FirewallCredentialUrl -Config $cfg -PwIndex $pwIdx -LinkBase $LinkBase
-                New-CardItem -Label $fwLabel -Detail $detail -Ring $ring -Link $credUrl -LinkText 'Credentials'
+                New-CardItem -Label $fwLabel -Detail $detail -Ring $ring -Actions @(New-Action -Dest 'itglue' -Url $credUrl)
             }
             $items += New-CardGroup -Label 'SonicWall' -Brand 'sonicwall.com' -Items $pills
         }
@@ -2685,7 +3221,7 @@ function Get-DashNetwork {
                 }
                 $detail += @(New-WanIpRows -Config $cfg -Vendor 'watchguard')
                 $credUrl = Get-FirewallCredentialUrl -Config $cfg -PwIndex $pwIdx -LinkBase $LinkBase
-                New-CardItem -Label $fwLabel -Detail $detail -Ring $ring -Link $credUrl -LinkText 'Credentials'
+                New-CardItem -Label $fwLabel -Detail $detail -Ring $ring -Actions @(New-Action -Dest 'itglue' -Url $credUrl)
             }
             $items += New-CardGroup -Label 'WatchGuard' -Brand 'watchguard.com' -Items $pills
         }
@@ -2696,11 +3232,88 @@ function Get-DashNetwork {
         try { $sites = Get-UnifiSites } catch { Write-Status "  UniFi query failed: $($_.Exception.Message)" Warning }
         $matched = @(Resolve-UnifiSites -Entry $Entry -OrgName $OrgName -Sites $sites)
         if ($matched.Count -gt 0) {
+            # Device fleet (for the exact gateway model + per-site offline/firmware NAME lists). Counts
+            # always come from the per-site stats; names only when this site owns its console (SoloHost).
+            $devData = $null
+            try { $devData = Get-UnifiDeviceData } catch { Write-Status "  UniFi devices query failed: $($_.Exception.Message)" Warning }
+
             $pills = foreach ($s in ($matched | Sort-Object { "$($_.Name)" })) {
                 $slug = if ($s.Slug) { $s.Slug } else { 'default' }
                 $seg  = if ($s.PathSeg) { $s.PathSeg } else { 'consoles' }
                 $link = if ($s.HostId) { "https://unifi.ui.com/$seg/$($s.HostId)/network/$slug/dashboard" } else { 'https://unifi.ui.com' }
-                New-CardItem -Label "$($s.Name)" -Link $link
+
+                # SoloHost sites can attribute device names to this client; scope name lists to network
+                # gear (exclude Protect cameras / Talk phones) so they track the network-scoped stats.
+                $netDevs = $null
+                if ($devData -and $s.SoloHost -and "$($s.HostId)" -and $devData.ByHost.ContainsKey("$($s.HostId)")) {
+                    $netDevs = @($devData.ByHost["$($s.HostId)"] | Where-Object { "$($_.productLine)" -eq 'network' })
+                }
+
+                $detail = @()
+                $ring = ''
+                $hasGateway = ([int]$s.GatewayCount -ge 1) -or [bool]$s.GatewayShort
+
+                # Firewall (the UniFi gateway). Prefer the exact model via the gateway's unique MAC, else
+                # the shortname->friendly map, else the raw shortname.
+                if ($hasGateway) {
+                    $gwModel = ''
+                    if ($devData -and $s.GatewayMac -and $devData.ByMac.ContainsKey($s.GatewayMac)) { $gwModel = "$($devData.ByMac[$s.GatewayMac].model)" }
+                    if (-not $gwModel -and $s.GatewayShort) { $gwModel = $script:UnifiGatewayNames["$($s.GatewayShort)"] }
+                    if (-not $gwModel) { $gwModel = "$($s.GatewayShort)" }
+                    if ($gwModel) { $detail += New-DetailRow -K 'Firewall' -V $gwModel }
+                }
+
+                # Wi-Fi. Try the connector bridge for the actual SSID NAMES; on any failure (old/offline/
+                # unresponsive console) fall back to the Site Manager SSID count.
+                if ([int]$s.WifiConfig -gt 0) {
+                    $ssids = Get-UnifiSsids -HostId "$($s.HostId)" -Slug "$($s.Slug)"
+                    if ($ssids -and @($ssids).Count -gt 0) {
+                        # Header = SSID count; the named SSIDs are listed below it.
+                        $detail += New-DetailRow -K 'Wi-Fi' -V "$(@($ssids).Count) SSID$(if (@($ssids).Count -ne 1){'s'})"
+                        foreach ($w in @($ssids | Sort-Object { -not $_.Enabled }, { "$($_.Name)" })) {
+                            $tags = @()
+                            if ($w.Guest) { $tags += 'guest' }
+                            if (-not $w.Enabled) { $tags += 'disabled' }
+                            $line = "$($w.Name)"
+                            if ($tags.Count) { $line += "  ($($tags -join ', '))" }
+                            $detail += New-DetailRow -V $line
+                        }
+                    } else {
+                        # Count-only fallback (SSID names not queryable for this console).
+                        $detail += New-DetailRow -K 'Wi-Fi' -V "$([int]$s.WifiConfig) SSID$(if ([int]$s.WifiConfig -ne 1){'s'})"
+                    }
+                }
+
+                # WAN IP + ISP - only when the UniFi gateway is this site's edge firewall (per request:
+                # suppress when the edge is a WatchGuard/SonicWall, i.e. UniFi reports no gateway here).
+                if ($hasGateway -and $s.WanIp) {
+                    $wanV = if ($s.IspName) { "$($s.WanIp)  ($($s.IspName))" } else { "$($s.WanIp)" }
+                    $detail += New-DetailRow -K 'WAN' -V $wanV
+                }
+
+                # Offline devices. SoloHost: device-derived count + names (header matches the list).
+                # Shared host: per-site stat count only (names can't be attributed to this client).
+                $offDevs = if ($netDevs) { @($netDevs | Where-Object { "$($_.status)" -ne 'online' } | Sort-Object { "$($_.name)" }) } else { @() }
+                $offCount = if ($netDevs) { $offDevs.Count } else { [int]$s.OfflineCount }
+                if ($offCount -gt 0) {
+                    $detail += New-DetailRow -K 'Offline devices' -V "$offCount" -State 'bad'
+                    foreach ($d in $offDevs) { $detail += New-DetailRow -V ("$($d.name)" + $(if ($d.model) { "  —  $($d.model)" } else { '' })) }
+                    $ring = '#DC3545'
+                }
+
+                # Firmware updates available. SoloHost: device-derived (the per-site stat under-reports);
+                # shared host: fall back to the stat count if it flags anything.
+                $updDevs = if ($netDevs) { @($netDevs | Where-Object { "$($_.firmwareStatus)" -and "$($_.firmwareStatus)" -ne 'upToDate' } | Sort-Object { "$($_.name)" }) } else { @() }
+                $updCount = if ($netDevs) { $updDevs.Count } else { [int]$s.UpdateCount }
+                if ($updCount -gt 0) {
+                    $detail += New-DetailRow -K 'Firmware updates' -V "$updCount"
+                    foreach ($d in $updDevs) {
+                        $ver = "$($d.updateAvailable)".Trim()
+                        $detail += New-DetailRow -V ("$($d.name)" + $(if ($ver) { "  →  $ver" } else { '' }))
+                    }
+                }
+
+                New-CardItem -Label "$($s.Name)" -Detail $detail -Ring $ring -Actions @(New-Action -Dest 'unifi' -Url $link)
             }
             $items += New-CardGroup -Label 'UniFi' -Brand 'ui.com' -Items $pills
         }
@@ -2735,12 +3348,16 @@ function Format-DetailMembers {
     # Wrap a run of V-only member rows (already rendered HTML) in the redesign's indented, left-bordered
     # list. A long list (> 7 rows, e.g. many stale devices) becomes an internally scrolling box so the
     # pill panel stays compact; the scrollbar is styled via the .scrolllist rule in New-DashboardHtml.
-    param([string[]]$Members)
+    param([string[]]$Members, [switch]$Flush)
     if (-not $Members -or $Members.Count -eq 0) { return '' }
+    # -Flush drops the indent + left border: used when the panel has no header (and no K rows), so a bare
+    # name list (e.g. the Automate Servers pill) sits flush instead of hanging off a vertical line.
+    $indent = if ($Flush) { 'margin:2px 0 0;' } else { 'margin:2px 0 0 4px;padding-left:11px;border-left:2px solid rgba(139,150,176,0.30);' }
     if ($Members.Count -gt 7) {
-        return "<div class=`"scrolllist`" style=`"max-height:116px;overflow:auto;margin:2px 0 0 4px;padding-left:11px;padding-right:6px;border-left:2px solid rgba(139,150,176,0.30);`">$($Members -join '')</div>"
+        return "<div class=`"scrolllist`" style=`"max-height:116px;overflow:auto;${indent}padding-right:6px;`">$($Members -join '')</div>"
     }
-    return "<div style=`"margin:2px 0 5px 4px;padding-left:11px;border-left:2px solid rgba(139,150,176,0.30);`">$($Members -join '')</div>"
+    $indentS = if ($Flush) { 'margin:2px 0 5px;' } else { 'margin:2px 0 5px 4px;padding-left:11px;border-left:2px solid rgba(139,150,176,0.30);' }
+    return "<div style=`"$indentS`">$($Members -join '')</div>"
 }
 
 function ConvertTo-CardItemHtml {
@@ -2750,7 +3367,7 @@ function ConvertTo-CardItemHtml {
     # Pills are always NEUTRAL now - brand identity is the logo (left) plus, for sub-boxes, the coloured
     # header strip. An explicit Bg still wins (kept for any deliberate override). Interactive pills
     # (link / expand) sit a touch brighter than static info pills so they read as actionable.
-    $isInteractive = [bool]($Item.Link -or (@($Item.Detail).Count -gt 0))
+    $isInteractive = [bool]($Item.Link -or (@($Item.Detail).Count -gt 0) -or (@($Item.Actions).Count -gt 0))
     if     ($Item.Bg)       { $bg = $Item.Bg; $border = 'none' }
     elseif ($isInteractive) { $bg = 'rgba(255,255,255,0.10)'; $border = '1px solid rgba(255,255,255,0.18)' }
     else                    { $bg = 'rgba(255,255,255,0.06)'; $border = '1px solid rgba(255,255,255,0.12)' }
@@ -2769,8 +3386,11 @@ function ConvertTo-CardItemHtml {
     else {
         $icon = ''
         if ($brand -and $brand.Logo) {
-            $icon = "<span style=`"display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:7px;background:#fff;flex:none;`">" +
-                    "<img src=`"$($brand.Logo)`" alt=`"`" width=`"18`" height=`"18`" style=`"display:block;width:18px;height:18px;object-fit:contain;`"></span>"
+            # Logo size inside the 26px tile defaults to 18px; an IconMap entry can set Px to fill more of
+            # the tile when its logo carries heavy internal whitespace (e.g. the ConnectWise compass).
+            $ipx = if ($brand.Px) { [int]$brand.Px } else { 18 }
+            $icon = "<span style=`"display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:7px;background:#fff;flex:none;overflow:hidden;`">" +
+                    "<img src=`"$($brand.Logo)`" alt=`"`" width=`"$ipx`" height=`"$ipx`" style=`"display:block;width:${ipx}px;height:${ipx}px;object-fit:contain;`"></span>"
         }
         $weight = '600'
         # Icon pinned left; label takes the remaining width and centres within it (flex:1). With no icon
@@ -2803,36 +3423,61 @@ function ConvertTo-CardItemHtml {
             # V-only entries buffer into an indented, left-bordered member list (scrollable when long) - the
             # redesign's treatment for name lists (stale devices, DCs, ...). K/V entries render as stat rows
             # with a muted label and a bright (or cyan-linked) value; a K-only entry is a sub-caption.
+            # When the panel has NO header (no DetailHead, no K rows at all) the list is the whole panel, so
+            # it renders FLUSH (no indent/vertical line) - e.g. the Automate Servers pill's bare name list.
+            $flushMembers = (-not $Item.DetailHead) -and (@($Item.Detail | Where-Object { $_.K }).Count -eq 0)
             $members = New-Object System.Collections.Generic.List[string]
             foreach ($r in @($Item.Detail)) {
                 $isMember = ($r.V -and -not $r.K)
-                if (-not $isMember -and $members.Count -gt 0) { $out.Add((Format-DetailMembers $members)); $members.Clear() }
+                if (-not $isMember -and $members.Count -gt 0) { $out.Add((Format-DetailMembers $members -Flush:$flushMembers)); $members.Clear() }
                 if ($r.K -and -not $r.V) {
                     $out.Add("<div style=`"font-size:12.5px;font-weight:600;color:#8b96b0;padding:3px 0;`">$(Get-HtmlEncoded $r.K)</div>")
                 } elseif ($r.K) {
-                    # State colours the value: 'bad' red, 'ok' green (redesign palette). A LINKED value is a
-                    # cyan underlined link that navigates without toggling the disclosure (it's in the panel).
+                    # State colours the value: 'bad' red, 'ok' green (redesign palette). With -Actions the
+                    # value stays PLAIN text and the destination icon-tiles sit to its right (the icons are the
+                    # links); a legacy -Link still renders the value itself as a cyan link.
                     $vc = switch ($r.State) { 'bad' { 'color:#e0556a;' } 'ok' { 'color:#3fbf73;' } default { '' } }
-                    $valHtml = if ($r.Link) {
-                        "<a href=`"$($r.Link)`" target=`"_blank`" rel=`"noopener`" style=`"flex:none;color:#34c5f0;font-weight:600;text-decoration:underline;text-underline-offset:2px;text-align:right;$vc`">$(Get-HtmlEncoded $r.V)</a>"
+                    $acts = if (@($r.Actions).Count -gt 0) { Format-DestIcons $r.Actions } else { '' }
+                    $valHtml = if ($acts) {
+                        "<span style=`"display:inline-flex;align-items:center;gap:8px;flex:none;`"><span style=`"color:#eef1f8;font-weight:600;$vc`">$(Get-HtmlEncoded $r.V)</span>$acts</span>"
+                    } elseif ($r.Link) {
+                        $td = if ($r.NoUnderline) { 'text-decoration:none;' } else { 'text-decoration:underline;text-underline-offset:2px;' }
+                        "<a href=`"$($r.Link)`" target=`"_blank`" rel=`"noopener`" style=`"flex:none;color:#34c5f0;font-weight:600;${td}text-align:right;$vc`">$(Get-HtmlEncoded $r.V)</a>"
                     } else {
                         "<span style=`"flex:none;color:#eef1f8;font-weight:600;$vc`">$(Get-HtmlEncoded $r.V)</span>"
                     }
-                    $out.Add("<div style=`"display:flex;justify-content:space-between;gap:12px;font-size:12.5px;padding:3px 0;`">" +
+                    $out.Add("<div style=`"display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:12.5px;padding:3px 0;`">" +
                              "<span style=`"flex:1;min-width:0;color:#8b96b0;line-height:1.3;`">$(Get-HtmlEncoded $r.K)</span>$valHtml</div>")
                 } else {
-                    # V-only entry. With a -Link it's a cyan underlined member link (e.g. a stale device or
-                    # domain controller -> its Automate page); otherwise a plain bright line.
-                    if ($r.Link) {
+                    # V-only entry. With -Actions the name is PLAIN text with the destination icon-tiles to its
+                    # right (a flex row: name left, icons right - e.g. a server + ScreenConnect + Automate). A
+                    # legacy -Link still renders the name as a cyan member link; otherwise a plain bright line.
+                    if (@($r.Actions).Count -gt 0) {
+                        $acts = Format-DestIcons $r.Actions
+                        # State colours the name (e.g. the MFA pill's green 'Federated' / red 'Not Federated');
+                        # default keeps the bright list colour. The destination icon-tiles sit to its right.
+                        $mc = switch ($r.State) { 'bad' { 'color:#e0556a;' } 'ok' { 'color:#3fbf73;' } default { 'color:#eef1f8;' } }
+                        $members.Add("<div style=`"display:flex;justify-content:space-between;align-items:center;gap:10px;padding:2px 0;`">" +
+                                     "<span style=`"flex:1;min-width:0;font-size:12.5px;$mc line-height:1.3;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</span>$acts</div>")
+                    } elseif ($r.Link) {
                         $members.Add("<a href=`"$($r.Link)`" target=`"_blank`" rel=`"noopener`" style=`"display:block;font-size:12.5px;font-weight:600;color:#34c5f0;text-decoration:underline;text-underline-offset:2px;padding:1px 0;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</a>")
                     } else {
-                        $members.Add("<div style=`"font-size:12.5px;color:#eef1f8;padding:1px 0;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</div>")
+                        # A plain member line. State colours it (e.g. the MFA pill's green 'Federated' /
+                        # red 'Not Federated' Duo-SSO status); default keeps the bright list colour.
+                        $mc = switch ($r.State) { 'bad' { 'color:#e0556a;' } 'ok' { 'color:#3fbf73;' } default { 'color:#eef1f8;' } }
+                        $members.Add("<div style=`"font-size:12.5px;$mc padding:1px 0;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</div>")
                     }
                 }
             }
-            if ($members.Count -gt 0) { $out.Add((Format-DetailMembers $members)); $members.Clear() }
+            if ($members.Count -gt 0) { $out.Add((Format-DetailMembers $members -Flush:$flushMembers)); $members.Clear() }
             $rows = ($out -join '')
-            if ($Item.Link) {
+            # Pill-level destinations sit at the bottom of the panel as an icon-tile cluster (the icons are the
+            # links). -Actions supersedes the legacy "<LinkText> ->" cyan text link, which is kept as a fallback.
+            $pillActs = if (@($Item.Actions).Count -gt 0) { Format-DestIcons $Item.Actions } else { '' }
+            if ($pillActs) {
+                # Icons-only line (no text) -> right-aligned.
+                $rows += "<div style=`"display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:5px;`">$pillActs</div>"
+            } elseif ($Item.Link) {
                 $lt = if ($Item.LinkText) { $Item.LinkText } else { 'Open' }
                 $rows += "<a href=`"$($Item.Link)`" target=`"_blank`" rel=`"noopener`" style=`"display:inline-flex;align-items:center;gap:5px;margin-top:11px;font-size:12px;font-weight:700;color:#34c5f0;text-decoration:underline;text-underline-offset:2px;`">$(Get-HtmlEncoded $lt) &#8599;</a>"
             }
@@ -2843,8 +3488,15 @@ function ConvertTo-CardItemHtml {
         }
     }
 
+    # Non-expandable pill with a destination: the WHOLE pill is the link (no trailing icon) - there's no
+    # dropdown to disambiguate, and the brand logo on the left already signals where it goes. Uses the first
+    # action's url. Number pills keep their centred column layout.
+    if (@($Item.Actions).Count -gt 0 -and $Item.Kind -ne 'number') {
+        $firstUrl = @($Item.Actions | Where-Object { $_ -and $_.Url } | Select-Object -First 1).Url
+        if ($firstUrl) { return "<a class=`"pill`" href=`"$firstUrl`" target=`"_blank`" rel=`"noopener`" style=`"$style`">$inner</a>" }
+    }
     if ($Item.Link) {
-        # Non-expandable link pill: trailing cyan up-right arrow (redesign) + hover class. Number pills,
+        # Legacy non-expandable link pill: trailing cyan up-right arrow (redesign) + hover class. Number pills,
         # which have a centred column layout, get no arrow.
         $arrow = if ($Item.Kind -ne 'number') { "<span style=`"flex:none;color:#34c5f0;font-size:13px;`">&#8599;</span>" } else { '' }
         return "<a class=`"pill`" href=`"$($Item.Link)`" target=`"_blank`" rel=`"noopener`" style=`"$style`">$inner$arrow</a>"
@@ -2866,6 +3518,43 @@ function Get-CardHeightScore {
         if ($it.Kind -eq 'group') { $n += 1 + @($it.Items).Count } else { $n += 1 }
     }
     return $n
+}
+
+function Test-HasLongValue {
+    # True when a detail row that should read on ONE line carries a single unbreakable token longer than
+    # the threshold - i.e. a DNS record (SPF/DMARC, flagged -Record) or a key/value stat. Such a card gets
+    # extra width (the 'wide' class) so the value doesn't wrap. Plain V-only MEMBER lines (UPN / device /
+    # DC name lists) are EXCLUDED: they're vertical lists where wrapping is natural, so they must not blow
+    # a card up to 1.5x just for a long email address. Recurses into bands.
+    param([object[]]$Items, [int]$Threshold = 26)
+    foreach ($it in @($Items)) {
+        if ($it.Kind -eq 'group') {
+            if (Test-HasLongValue -Items @($it.Items) -Threshold $Threshold) { return $true }
+            continue
+        }
+        foreach ($r in @($it.Detail)) {
+            # Only width-driving rows: key/value stats (have a K) and flagged DNS records. Skip bare members.
+            if (-not ($r.K -or $r.Record)) { continue }
+            $v = "$($r.V)"
+            if (-not $v) { continue }
+            foreach ($tok in ($v -split '\s+')) { if ($tok.Length -gt $Threshold) { return $true } }
+        }
+    }
+    return $false
+}
+
+function Get-CardWidthClass {
+    # Width class for a card's (already-banded) items, driving its grid span on the half-width-track grid:
+    #   split  -> tall card (span 4 ~= 2x): two-up bands, or a single band's pills split into two columns
+    #   wide   -> holds a long value (span 3 ~= 1.5x): widen so emails/SPF includes don't wrap
+    #   normal -> span 2 (~= the original single-track width)
+    param([object[]]$Items)
+    # A long single-line value (DNS record / stat) needs WIDTH, so 'wide' (single-column 1.5x) takes
+    # precedence over the height-driven 'split': widening to fit the text beats splitting for height, and
+    # avoids a tall 2x card. Only genuinely tall cards with no such value fall through to 'split'.
+    if (Test-HasLongValue -Items $Items) { return 'wide' }
+    if ((Get-CardHeightScore -Items $Items) -gt $script:TallCardThreshold) { return 'split' }
+    return 'normal'
 }
 
 function Group-CardItems {
@@ -2902,20 +3591,34 @@ function ConvertTo-CardHtml {
     $h3 = "<h3 style=`"margin:0;color:#fff;font-size:13px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;text-align:center;opacity:0.82;`">$(Get-HtmlEncoded $Card.Title)</h3>"
 
     # Cards size to their content (no fixed square - band-heavy cards would otherwise overflow it).
-    # A tall, band-heavy card spans TWO grid columns and lays its bands out two-up, roughly halving the
-    # height so it doesn't become tall & narrow. A modest min-height keeps light cards from looking thin.
+    # Width comes from a grid span on the half-width-track grid (see New-DashboardHtml): normal=2,
+    # wide=3 (~1.5x, for long values), split=4 (~2x, for tall cards). A modest min-height keeps light
+    # cards from looking thin.
     $base = "background:$($script:CardColor);border-radius:16px;padding:22px 20px;display:flex;flex-direction:column;gap:14px;min-height:200px;box-shadow:0 2px 6px rgba(5,21,84,0.12);"
-    if ((Get-CardHeightScore -Items $items) -gt $script:TallCardThreshold) {
-        # Two-up via CSS multi-column: bands pack by their natural height (no stretching, so a single-pill
-        # band like Duo has no dead space); break-inside keeps each band intact, margin gives the gap.
-        $body = (@($items) | ForEach-Object { "<div style=`"break-inside:avoid;margin-bottom:10px;`">$(ConvertTo-CardItemHtml $_)</div>" }) -join ''
-        $inner = "<div style=`"flex:1;column-count:2;column-gap:10px;`">$body</div>"
-        return "<div style=`"grid-column:span 2;$base`">$h3$inner</div>"
+    $class = Get-CardWidthClass -Items $items
+    $span  = switch ($class) { 'split' { 4 } 'wide' { 3 } default { 2 } }
+    $gc    = "grid-column:span $span;"
+
+    if ($class -eq 'split') {
+        # A tall card. If it's essentially ONE band (e.g. Backup=Veeam, Network=UniFi), split that band's
+        # pills into two columns ("half left / half right"). Otherwise (several bands, e.g. Identity) keep
+        # the two-up-over-bands column flow so the bands pack into the width.
+        $groups   = @($items | Where-Object { $_.Kind -eq 'group' })
+        $nonGroup = @($items | Where-Object { $_.Kind -ne 'group' })
+        if ($groups.Count -eq 1 -and $nonGroup.Count -eq 0) {
+            $inner = "<div style=`"flex:1;`">$(ConvertTo-CardItemHtml $groups[0] -TwoCol)</div>"
+        } else {
+            # Two-up via CSS multi-column: bands pack by their natural height (no stretching, so a single-pill
+            # band like Duo has no dead space); break-inside keeps each band intact, margin gives the gap.
+            $body  = (@($items) | ForEach-Object { "<div style=`"break-inside:avoid;margin-bottom:10px;`">$(ConvertTo-CardItemHtml $_)</div>" }) -join ''
+            $inner = "<div style=`"flex:1;column-count:2;column-gap:10px;`">$body</div>"
+        }
+        return "<div style=`"$gc$base`">$h3$inner</div>"
     }
 
     $body = ($items | ForEach-Object { ConvertTo-CardItemHtml $_ }) -join ''
     $inner = "<div style=`"flex:1;display:flex;flex-direction:column;justify-content:center;gap:10px;`">$body</div>"
-    return "<div style=`"$base`">$h3$inner</div>"
+    return "<div style=`"$gc$base`">$h3$inner</div>"
 }
 
 function New-DashboardHtml {
@@ -2932,13 +3635,21 @@ function New-DashboardHtml {
         "details[open] > summary .xcaret{transform:rotate(180deg);}" +
         ".pill{transition:background .15s;}" +
         ".pill:hover{background:rgba(255,255,255,0.16)!important;}" +
+        ".dest{transition:transform .12s, box-shadow .12s;}" +
+        ".dest:hover{transform:translateY(-1px);box-shadow:0 3px 9px rgba(0,0,0,0.45);}" +
         ".scrolllist{scrollbar-width:thin;scrollbar-color:rgba(120,180,230,0.45) transparent;}" +
         ".scrolllist::-webkit-scrollbar{width:6px;}" +
         ".scrolllist::-webkit-scrollbar-thumb{background:rgba(120,180,230,0.45);border-radius:3px;}" +
         ".scrolllist::-webkit-scrollbar-thumb:hover{background:rgba(120,180,230,0.7);}" +
         ".scrolllist::-webkit-scrollbar-track{background:transparent;}" +
         "</style>"
-    return "$caretCss<div style=`"display:grid;grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));gap:18px;align-items:start;`">$cards</div>"
+    # Half-width base track (was minmax(260px,...)): every card spans an explicit number of these so we
+    # get normal (2 ~= the old 260-ish width), wide (3 ~= 1.5x) and split (4 ~= 2x) sizes. At our ~1184px
+    # inner width this yields 8 tracks; a span-2 card is ~282px (== the old layout) so density is kept
+    # (4 normal cards per row).
+    # auto-FILL (not auto-fit): empty trailing tracks keep their width instead of collapsing, so a card
+    # alone on the last row stays its span width rather than stretching across the whole row.
+    return "$caretCss<div style=`"display:grid;grid-template-columns:repeat(auto-fill, minmax(130px, 1fr));gap:18px;align-items:start;`">$cards</div>"
 }
 
 function New-PreviewDocument {
