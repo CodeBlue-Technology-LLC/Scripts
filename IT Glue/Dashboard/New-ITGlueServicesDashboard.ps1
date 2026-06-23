@@ -2345,7 +2345,8 @@ function Get-AutomateDuoProxyItem {
     # "Duo Security Authentication Proxy <version>" with a clean Version field (note: this does NOT collide
     # with the "Duo Authentication for Windows Logon" agent the Duo Logon pill counts - different string).
     # The pill gets a red ring when any install is behind the latest build seen across the fleet
-    # (Get-DuoProxyLatest); clicking it lists each computer and its version, outdated ones flagged red.
+    # (Get-DuoProxyLatest); clicking it lists each server with its version on the right (green if current,
+    # red if behind) and a ScreenConnect "Launch Control" link to remote into that machine via Automate.
     # Returns $null when the client has no proxy installed anywhere (no pill).
     param([pscustomobject]$Entry, [string]$OrgName)
     $autoId = Resolve-AutomateClient -Entry $Entry -OrgName $OrgName
@@ -2370,17 +2371,13 @@ function Get-AutomateDuoProxyItem {
     $installs = @($byComp.Values | Sort-Object { "$($_.ComputerName)" })
     $outdated = @($installs | Where-Object { $latest -and ((Compare-DuoVersion "$($_.Version)" $latest) -lt 0) })
 
-    $rows = @()
-    if ($latest) { $rows += New-DetailRow -K 'Latest version' -V $latest }
-    $rows += @($installs | ForEach-Object {
+    $rows = @($installs | ForEach-Object {
         $stale = $latest -and ((Compare-DuoVersion "$($_.Version)" $latest) -lt 0)
         New-DetailRow -K "$($_.ComputerName)" -V "$($_.Version)" -State $(if ($stale) { 'bad' } else { 'ok' }) `
-            -Actions @(New-Action -Dest 'automate' -Url "$($script:AutomateUrl)/automate/computer/$($_.ComputerId)")
+            -Actions @(New-Action -Dest 'screenconnect' -Url (Get-AutomateControlLink -CompId "$($_.ComputerId)"))
     })
 
-    $link = "$($script:AutomateUrl)/automate/browse/companies/computers?companyId=$autoId"
-    return New-CardItem -Label "Auth Proxy: $(Format-CountNoun $installs.Count 'device')" `
-        -Actions @(New-Action -Dest 'automate' -Url $link) -Detail $rows -Brand 'duo.com' -Alert:($outdated.Count -gt 0)
+    return New-CardItem -Label 'Authentication Proxy' -Detail $rows -Brand 'duo.com' -Alert:($outdated.Count -gt 0)
 }
 
 function Get-ConfigCountPill {
