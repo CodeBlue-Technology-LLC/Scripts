@@ -15,7 +15,7 @@
       - Backup        : Veeam (VSPC REST API) if present, else Cove; TB + device/VM counts.
       - M365 Backup   : Cove M365 backup (only if the org has M365), else "None".
       - Deliverability: per mail-enabled M365 domain, a pill (DNS-host icon) expanding to its live
-                        SPF/DKIM/DMARC posture; green ring when healthy, red outline when records lapse.
+                        MX + SPF/DKIM/DMARC posture; green ring when healthy, red outline when records lapse.
       - M365 Licenses : read from IT Glue's native "Microsoft Licenses" flexible asset.
 
     CLIENT MATCHING IS AUTOMATIC. Each vendor is resolved against the org by normalized name.
@@ -231,6 +231,16 @@ function Initialize-Credentials {
             $creds.Cove = @{ Configured = $true; PartnerName = $partner; ApiUser = $apiUser; ApiToken = $apiToken }
         } else { $creds.Cove = @{ Configured = $false } }
         $changed = $true
+    }
+
+    # Cove MSP Billing API (Limited Preview) - optional, separate from the backup API token above. Enables
+    # the per-tenant M365 mailbox count on the M365 backup pill. The sfdcid + x-api-key come from N-able.
+    if ($creds.Cove.Configured -and -not $creds.Cove.BillingApiKey) {
+        if ((Read-Host "Configure Cove MSP Billing API (adds M365 mailbox counts)? (y/N)") -match '^[Yy]') {
+            $creds.Cove.BillingSfdcId = Read-Host "  Cove Billing sfdcid (partner Salesforce id)"
+            $creds.Cove.BillingApiKey = Read-Host "  Cove Billing x-api-key"
+            $changed = $true
+        }
     }
 
     if (-not $creds.VeeamVspc) {
@@ -707,7 +717,7 @@ function Get-CoveDevices {
     $url = 'https://api.backup.management/jsonapi'
     $data = @{ jsonrpc='2.0'; id='2'; visa=$Visa; method='EnumerateAccountStatistics'; params=@{ query=@{
         PartnerId         = [int]$PartnerId
-        Columns           = @('AU','AR','AN','MN','OS','OT','PD','AP','PN','T3','US','I81')
+        Columns           = @('AU','AR','AN','OS','OT','AP','PN','T3','US','TS','I81')
         OrderBy           = 'CD DESC'
         StartRecordNumber = 0
         RecordsCount      = $MaxDevices
@@ -716,17 +726,92 @@ function Get-CoveDevices {
         -Headers @{ Authorization = "Bearer $Visa" } -Body ([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $data -Depth 6)))
     $devices = @()
     foreach ($d in $resp.result.result) {
+        # OT: '1' = Workstation, '2' = Server (OS holds the full edition string). TS = last SUCCESSFUL
+        # backup as Unix seconds ('0'/blank when the device has never completed one). US = used storage.
+        $ot = ($d.Settings.OT -join ''); $tsRaw = ($d.Settings.TS -join ''); $usRaw = ($d.Settings.US -join '')
+        $used = 0L; if ($usRaw -match '^\d+$') { $used = [int64]$usRaw }
         $devices += [pscustomobject]@{
-            DeviceName  = ($d.Settings.AN -join '')
-            OSType      = ($d.Settings.OT -join '')          # e.g. Workstation / Server
-            Product     = ($d.Settings.PN -join '')
-            DataSources = ($d.Settings.AP -join '')          # e.g. "FileSystem, Exchange, ..."
-            Physicality = ($d.Settings.I81 -join '')
-            SelectedGB  = [Math]::Round([Decimal](($d.Settings.T3 -join '') / 1GB), 2)
-            UsedGB      = [Math]::Round([Decimal](($d.Settings.US -join '') / 1GB), 2)
+            DeviceName    = ($d.Settings.AN -join '')
+            AccountName   = ($d.Settings.AR -join '')        # tenant/company friendly name (== billing UsageCompanyName)
+            Type          = if ($ot -eq '2') { 'Server' } else { 'Workstation' }
+            OS            = ($d.Settings.OS -join '')
+            Product       = ($d.Settings.PN -join '')
+            DataSources   = ($d.Settings.AP -join '')        # e.g. "FileSystem, Exchange, ..."
+            Physicality   = ($d.Settings.I81 -join '')
+            SelectedGB    = [Math]::Round([Decimal](($d.Settings.T3 -join '') / 1GB), 2)
+            UsedGB        = [Math]::Round([Decimal]($used / 1GB), 2)
+            UsedBytes     = $used
+            LastBackupUtc = if ($tsRaw -match '^\d+$' -and [int64]$tsRaw -gt 0) { [DateTimeOffset]::FromUnixTimeSeconds([int64]$tsRaw).UtcDateTime } else { $null }
         }
     }
     return $devices
+}
+
+# ---- Cove MSP Billing API (per-tenant M365 protected-mailbox counts) ----
+# A SEPARATE plain-REST API (not the JSON-RPC backup.management one): a finalised monthly invoice
+# exposes device-level usage where each row tagged SKU 'MSPUK-BU-O365PRO' is one protected mailbox
+# (Detail = email, UsageCompanyName = tenant). We pull the most recent finalised invoice ONCE per run
+# and build a tenant -> mailbox map keyed by company name (which equals the Cove partner name / the
+# backup device's AR field). Invoice-driven, so the figure is the prior finalised month, not real-time.
+$script:CoveBillingBase = 'https://prod-nableboomi.n-able.com/ws/rest/V1/PSA_API'
+$script:CoveBillingM365 = $null   # lazy cache: lowercased company -> @{ Mailboxes; Domains; PrimaryDomain }
+
+function Get-CoveBillingM365 {
+    param([hashtable]$Creds)
+    if ($null -ne $script:CoveBillingM365) { return $script:CoveBillingM365 }
+    $script:CoveBillingM365 = @{}
+    $sfdc = "$($Creds.Cove.BillingSfdcId)"; $key = "$($Creds.Cove.BillingApiKey)"
+    if ([string]::IsNullOrWhiteSpace($sfdc) -or [string]::IsNullOrWhiteSpace($key)) { return $script:CoveBillingM365 }
+    $headers = @{ 'x-api-key' = $key; 'Content-Type' = 'application/json' }
+    $M365Sku = 'MSPUK-BU-O365PRO'
+    try {
+        # Current month isn't invoiced yet, so walk back until a finalised invoice is found.
+        $usage = $null
+        foreach ($back in 1..3) {
+            $tf  = (Get-Date).AddMonths(-$back).ToString('yyyyMM')
+            $inv = Invoke-RestMethod -Method Post -Uri "$($script:CoveBillingBase)/InvoicesReady/$sfdc/$tf" -Headers $headers -TimeoutSec 60
+            $i   = @($inv.InvoicesReady)[0]; if (-not $i) { continue }
+            $c   = @($i.Contracts)[0]
+            $usage = Invoke-RestMethod -Method Post -Uri "$($script:CoveBillingBase)/PSAUsageDetailsDevices/$sfdc/$tf/$($c.ContractID)/$($i.InvoiceID)" -Headers $headers -TimeoutSec 120
+            break
+        }
+        if (-not $usage) { Write-Status "  Cove billing: no finalised invoice in the last 3 months." Warning; return $script:CoveBillingM365 }
+
+        # Tally mailboxes + per-domain counts (from each mailbox email) per tenant.
+        $byCompany = @{}
+        foreach ($cl in $usage.Clients) {
+            foreach ($dev in $cl.Devices) {
+                $m = $dev.TotalByService | Where-Object { $_.Sku -eq $M365Sku }; if (-not $m) { continue }
+                $company = "$($dev.UsageCompanyName)"
+                if (-not $byCompany.ContainsKey($company)) { $byCompany[$company] = @{ Count = 0; Domains = @{} } }
+                $byCompany[$company].Count += [int]$m.Quantity
+                if ("$($dev.Detail)" -match '@(.+)$') {
+                    $dom = $matches[1].ToLower()
+                    if (-not $byCompany[$company].Domains.ContainsKey($dom)) { $byCompany[$company].Domains[$dom] = 0 }
+                    $byCompany[$company].Domains[$dom]++
+                }
+            }
+        }
+        foreach ($company in $byCompany.Keys) {
+            $info = $byCompany[$company]
+            # Domain breakdown, most mailboxes first; an *.onmicrosoft.com is the tenant default and the
+            # least recognisable, so it sorts last and won't be picked as the headline (primary) domain.
+            $domList = @($info.Domains.GetEnumerator() |
+                Sort-Object @{ Expression = { $_.Key -like '*.onmicrosoft.com' } },
+                            @{ Expression = { $_.Value }; Descending = $true },
+                            @{ Expression = { $_.Key } } |
+                ForEach-Object { [pscustomobject]@{ Domain = $_.Key; Count = $_.Value } })
+            $script:CoveBillingM365[$company.ToLower()] = @{
+                Mailboxes     = $info.Count
+                Domains       = $domList
+                PrimaryDomain = if ($domList.Count) { $domList[0].Domain } else { '' }
+            }
+        }
+        Write-Status "Cove billing: $($script:CoveBillingM365.Count) M365 tenants loaded." Detail
+    } catch {
+        Write-Status "  Cove billing query failed: $($_.Exception.Message)" Warning
+    }
+    return $script:CoveBillingM365
 }
 
 # ---- Veeam Service Provider Console (REST) ----
@@ -1053,8 +1138,11 @@ function New-DetailRow {
     # ScreenConnect + Automate icons); -Link is the legacy single-link form (kept for back-compat).
     # -Record marks a V-only line as a single-string DNS record (SPF/DMARC) rather than a list item: it
     # reads best on one line, so it (unlike a name/device member) drives the card's width (Test-HasLongValue).
-    param([string]$K = '', [string]$V = '', [ValidateSet('','ok','bad')][string]$State = '', [string]$Link = '', [object[]]$Actions = @(), [switch]$NoUnderline, [switch]$Record)
-    [pscustomobject]@{ K = $K; V = $V; State = $State; Link = $Link; Actions = @($Actions); NoUnderline = [bool]$NoUnderline; Record = [bool]$Record }
+    # -Indent nests the row under the preceding stat row inside the indented, left-bordered "member" box
+    # (the vertical line), WITHOUT changing its styling: a K/V -Indent row keeps the normal key .... value
+    # look, it just hangs under the line (e.g. the per-domain split under 'Mailboxes').
+    param([string]$K = '', [string]$V = '', [ValidateSet('','ok','bad')][string]$State = '', [string]$Link = '', [object[]]$Actions = @(), [switch]$NoUnderline, [switch]$Record, [switch]$Indent)
+    [pscustomobject]@{ K = $K; V = $V; State = $State; Link = $Link; Actions = @($Actions); NoUnderline = [bool]$NoUnderline; Record = [bool]$Record; Indent = [bool]$Indent }
 }
 
 # Destination registry: dest key -> the IconMap brand whose logo represents it + the hover tooltip. Each
@@ -1190,10 +1278,11 @@ function Get-DashAntivirus {
     # client actually has Duo - reuse the per-client Duo match the Identity card resolves and caches on
     # the service-map entry (the build order resolves Identity before this card, so the cache is warm).
     if ($Entry.PSObject.Properties['duo'] -and $Entry.duo) {
-        $duoDev = Get-AutomateDuoLogonItem -Entry $Entry -OrgName $OrgName
-        if ($duoDev) { $lines += $duoDev }
+        # Authentication Proxy first, then Duo Logon coverage.
         $duoProxy = Get-AutomateDuoProxyItem -Entry $Entry -OrgName $OrgName
         if ($duoProxy) { $lines += $duoProxy }
+        $duoDev = Get-AutomateDuoLogonItem -Entry $Entry -OrgName $OrgName
+        if ($duoDev) { $lines += $duoDev }
     }
 
     return New-Card -Title 'Endpoint Security' -Items $lines
@@ -1269,11 +1358,14 @@ function Get-DashIdentity {
 }
 
 function Get-DashBackup {
-    # Category tile: lists every active backup product. Endpoint/server backup (Veeam, Cove) and
-    # Cove M365 cloud backup all live here; the M365 line is explicitly labelled "365" so it is not
-    # confused with server/workstation backup.
+    # Category tile: lists every active backup product. Endpoint/server backup (Veeam, Cove) lives here;
+    # Cove M365 cloud backup is built here too but rendered on the Email card (as a 'Cove Data Protection'
+    # pill under a neutral 'Backup' band) so it isn't confused with server/workstation backup.
     param([pscustomobject]$Entry, [string]$OrgName, [hashtable]$Creds)
     $lines = @()
+    # The Cove M365 cloud-backup pill is built here but RENDERED on the Email card (Get-DashM365 reads this
+    # after Get-DashBackup runs). Reset per org so a prior org's group never leaks if this org has no M365.
+    $script:CoveM365EmailGroup = $null
 
     if ($Creds.VeeamVspc.Configured) {
         try {
@@ -1324,22 +1416,63 @@ function Get-DashBackup {
             $partner = Resolve-OrgServiceId -Entry $Entry -VendorKey 'cove' -VendorLabel 'Cove' -OrgName $OrgName -Candidates $partners
             if ($partner) {
                 $devices = Get-CoveDevices -Visa $visa -PartnerId $partner.Id
-                # Cove M365 cloud accounts have Physicality 'Undefined'; endpoint/server backups do
-                # not. Split them so the M365 line is clearly labelled. Ref: CWM-SyncNableCoveData.ps1.
-                # Both go in a 'Cove' sub-box, so the pills drop the 'Cove' prefix.
+                # Cove M365 cloud accounts have Physicality 'Undefined'; endpoint (server/workstation)
+                # backups do not. The endpoint pills stay HERE on the Backup card in a 'Cove' sub-box; the
+                # M365 cloud-backup pill is split off into its OWN 'Cove' sub-box that the Email card picks
+                # up (stashed in $script:CoveM365EmailGroup) so it sits beside the Microsoft 365 group there.
                 $coveItems = @()
-                $endpoint = @($devices | Where-Object { "$($_.Physicality)" -ne 'Undefined' })
-                if ($endpoint.Count -gt 0) {
-                    $servers = @($endpoint | Where-Object { $_.OSType -match 'server' }).Count
-                    $workstations = $endpoint.Count - $servers
-                    $tb = [Math]::Round((($endpoint | Measure-Object -Property UsedGB -Sum).Sum) / 1024, 2)
-                    $coveItems += New-CardItem -Label "$tb TB ($servers srv, $workstations wks)" -Brand 'n-able.com'
+
+                # One EXPANDABLE pill per endpoint, matching the Veeam pills: the pill shows the machine
+                # name; clicking it opens the device type, size (used storage) and last-backup age. Servers
+                # first, then by name. Red ring when the last successful backup is missing or >25h old (25h,
+                # not 24h, to avoid false alarms from daily schedule drift).
+                $cutoff = (Get-Date).ToUniversalTime().AddHours(-25)
+                $endpoint = @($devices | Where-Object { "$($_.Physicality)" -ne 'Undefined' } |
+                    Sort-Object @{ Expression = { $_.Type -ne 'Server' } }, DeviceName)
+                foreach ($d in $endpoint) {
+                    $stale = (-not $d.LastBackupUtc) -or ($d.LastBackupUtc -lt $cutoff)
+                    $age   = if ($d.LastBackupUtc) { Format-RelativeAge $d.LastBackupUtc } else { 'no backup' }
+                    $size  = Format-BackupSize $d.UsedBytes; if (-not $size) { $size = [char]0x2014 }
+                    $detail = @(
+                        New-DetailRow -K 'Device type' -V $d.Type
+                        New-DetailRow -K 'Size'        -V $size
+                        New-DetailRow -K 'Last backup' -V $age -State $(if ($stale) { 'bad' } else { 'ok' })
+                    )
+                    $coveItems += New-CardItem -Label "$($d.DeviceName)" -Detail $detail -Brand 'n-able.com' -Ring $(if ($stale) { '#DC3545' } else { '' })
                 }
+
+                # M365 cloud backup: one expandable 'Cove Data Protection' pill under a neutral 'Backup' band;
+                # the panel shows the protected-mailbox count (from the Cove Billing API), the per-domain
+                # breakdown (only when the tenant spans more than one domain), and the stored size. Built
+                # here (where the Cove session/devices already are) but stashed for the Email card to render.
                 $m365 = @($devices | Where-Object { "$($_.Physicality)" -eq 'Undefined' })
                 if ($m365.Count -gt 0) {
-                    # M365 backup: just list the protected tenant(s) by name - no TB/tenant count.
-                    $m365Names = @($m365 | ForEach-Object { "$($_.DeviceName)" } | Where-Object { $_ } | Sort-Object -Unique)
-                    $coveItems += New-CardItem -Label ($m365Names -join ', ') -Brand 'n-able.com'
+                    $billing = Get-CoveBillingM365 -Creds $Creds
+                    $company = @($m365 | ForEach-Object { "$($_.AccountName)" } | Where-Object { $_ } | Select-Object -First 1)
+                    if (-not $company) { $company = "$($partner.Name)" }
+                    $bill = $billing["$($company.ToLower())"]
+                    $usedBytes = [int64](($m365 | Measure-Object -Property UsedBytes -Sum).Sum)
+                    $storage = Format-BackupSize $usedBytes; if (-not $storage) { $storage = [char]0x2014 }
+                    # Cove protects the whole M365 TENANT (every mailbox across every domain), not a single
+                    # domain, so the pill is titled for the product - 'Cove Data Protection' - rather than a
+                    # mail domain. Its n-able logo rides on the pill; the band header (below) is the generic
+                    # 'Backup' category strip.
+                    if ($bill -and $bill.Mailboxes -gt 0) {
+                        # 'Mailboxes <n>' stat row; when the tenant spans >1 domain, the per-domain split
+                        # hangs beneath it as -Indent K/V rows - same "domain .... count" styling as every
+                        # other dropdown stat row, just nested under the vertical line.
+                        $detail = @(New-DetailRow -K 'Mailboxes' -V "$($bill.Mailboxes)")
+                        if ($bill.Domains.Count -gt 1) { foreach ($dn in $bill.Domains) { $detail += New-DetailRow -K $dn.Domain -V "$($dn.Count)" -Indent } }
+                        $detail += New-DetailRow -K 'Storage' -V $storage
+                        $m365Item = New-CardItem -Label 'Cove Data Protection' -Detail $detail -Brand 'n-able.com'
+                    } else {
+                        # No billing match (name mismatch or tenant not yet invoiced): just the stored size,
+                        # with no mailbox count.
+                        $m365Item = New-CardItem -Label 'Cove Data Protection' -Detail @(New-DetailRow -K 'Storage' -V $storage) -Brand 'n-able.com'
+                    }
+                    # No -Brand on the band so the header strip uses the neutral category colour (matching
+                    # the Deliverability banner); the Cove logo lives on the pill instead.
+                    $script:CoveM365EmailGroup = New-CardGroup -Label 'Backup' -Items @($m365Item)
                 }
                 if ($coveItems.Count -gt 0) { $lines += New-CardGroup -Label 'Cove' -Brand 'n-able.com' -Items $coveItems }
             }
@@ -1411,13 +1544,25 @@ function Get-NameserverBrand {
 }
 
 function Get-DomainDeliverability {
-    # Live DNS read of a domain's email-authentication posture (SPF / DKIM / DMARC) for the Email card's
-    # Deliverability pills. All lookups go to a PUBLIC resolver (1.1.1.1) so the box's internal AD /
-    # split-horizon DNS can't mask the real external record. Every record type is independent; a missing
-    # record makes Resolve-DnsName throw, so each lookup is wrapped. Returns per-record value + state
-    # ('ok'/'bad') plus AllOk (true only when all three are 'ok'). DKIM assumes the M365 selector pattern.
+    # Live DNS read of a domain's mail posture (MX + SPF / DKIM / DMARC) for the Email card's Deliverability
+    # pills. All lookups go to a PUBLIC resolver (1.1.1.1) so the box's internal AD / split-horizon DNS can't
+    # mask the real external record. Every record type is independent; a missing record makes Resolve-DnsName
+    # throw, so each lookup is wrapped. Returns per-record value + state ('ok'/'bad') plus AllOk (true only
+    # when all four are 'ok'). DKIM assumes the M365 selector pattern.
     param([string]$Domain)
     $dns = @{ Server = '1.1.1.1'; QuickTimeout = $true; ErrorAction = 'Stop' }
+
+    # -- MX: the domain's mail exchangers, listed first in the panel because it's where mail actually lands
+    #    (M365 domains point at <domain>-com.mail.protection.outlook.com). Listed lowest-preference first; a
+    #    missing MX means mail can't be delivered at all, so it's flagged bad.
+    $mx = @(); $mxState = 'bad'
+    try {
+        $mx = @(Resolve-DnsName -Name $Domain -Type MX @dns |
+                Where-Object { $_.Type -eq 'MX' } |
+                Sort-Object Preference |
+                ForEach-Object { "$($_.Preference) $($_.NameExchange)".Trim() })
+        if ($mx.Count -gt 0) { $mxState = 'ok' }
+    } catch { }
 
     # -- SPF: a single TXT at the apex starting v=spf1. More than one SPF record is invalid (RFC 7208);
     #    must end in an 'all' qualifier, and +all (passes everything) is treated as broken.
@@ -1460,10 +1605,11 @@ function Get-DomainDeliverability {
     } catch { }
 
     [pscustomobject]@{
+        Mx = @($mx); MxState = $mxState
         Spf = $spf; SpfState = $spfState
         Dkim = $dkim; DkimState = $dkimState
         Dmarc = $dmarc; DmarcState = $dmarcState
-        AllOk = ($spfState -eq 'ok' -and $dkimState -eq 'ok' -and $dmarcState -eq 'ok')
+        AllOk = ($mxState -eq 'ok' -and $spfState -eq 'ok' -and $dkimState -eq 'ok' -and $dmarcState -eq 'ok')
     }
 }
 
@@ -1619,6 +1765,57 @@ function Test-DuoFederationState {
     } catch { Write-Status "  CIPP domain federation query failed: $($_.Exception.Message)" Warning }
     return $false
 }
+function Get-CippMfaPosture {
+    # Tenant-level MFA enforcement mechanisms, to explain the pill's count in the dropdown breakdown:
+    #   - SecurityDefaults: the tenant-wide on/off toggle (authoritative boolean).
+    #   - CaMfaUsers: how many of $RelevantIds (the pill's enabled, non-guest members) are actually covered
+    #     for MFA by ENABLED Conditional Access policies. Rather than trust the per-user ListMFAUsers
+    #     CoveredByCA (which is unavailable on unlicensed/limited tenants), we resolve coverage from the
+    #     policies themselves: for each enabled policy that requires MFA (built-in 'mfa' grant or an auth
+    #     strength) we take its included users + the transitive members of its included groups (or every
+    #     relevant user when it targets 'All'), drop that policy's excluded users/groups, then union across
+    #     policies and intersect with $RelevantIds. Group membership is fetched once and cached per run.
+    # Each value is $null when its Graph call is unavailable (permissions), so the caller omits the row.
+    param([string]$TenantFilter, [string[]]$RelevantIds)
+    $cmp = [System.StringComparer]::OrdinalIgnoreCase
+    $sd = $null; $caUsers = $null
+    try { $sd = [bool]((Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint 'policies/identitySecurityDefaultsEnforcementPolicy').isEnabled) } catch {}
+    # Build the relevant-user set via Add (the HashSet(IEnumerable,comparer) ctor is a splatting trap in PS5.1).
+    $relevant = New-Object 'System.Collections.Generic.HashSet[string]' ($cmp)
+    foreach ($id in @($RelevantIds)) { if ($id) { [void]$relevant.Add("$id") } }
+    $groupCache = @{}
+    $expandGroup = {
+        param($gid)
+        if (-not $groupCache.ContainsKey($gid)) {
+            $ids = @()
+            try { $ids = @(Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint "groups/$gid/transitiveMembers?`$select=id" | ForEach-Object { "$($_.id)" } | Where-Object { $_ }) } catch {}
+            $groupCache[$gid] = $ids
+        }
+        return $groupCache[$gid]
+    }
+    try {
+        $pols = @(Invoke-CippGraph -TenantFilter $TenantFilter -Endpoint 'identity/conditionalAccess/policies')
+        $covered = New-Object 'System.Collections.Generic.HashSet[string]' ($cmp)
+        foreach ($p in $pols) {
+            if ("$($p.state)" -ne 'enabled') { continue }
+            $gc = $p.grantControls
+            if (-not ((@($gc.builtInControls) -contains 'mfa') -or $gc.authenticationStrength)) { continue }
+            $u = $p.conditions.users
+            $inc = New-Object 'System.Collections.Generic.HashSet[string]' ($cmp)
+            if (@($u.includeUsers) -contains 'All') {
+                foreach ($id in $relevant) { [void]$inc.Add($id) }
+            } else {
+                foreach ($iu in @($u.includeUsers)) { if ($iu -and $iu -notin @('None','GuestsOrExternalUsers')) { [void]$inc.Add("$iu") } }
+            }
+            foreach ($g in @($u.includeGroups)) { foreach ($m in (& $expandGroup "$g")) { [void]$inc.Add($m) } }
+            foreach ($eu in @($u.excludeUsers)) { [void]$inc.Remove("$eu") }
+            foreach ($g in @($u.excludeGroups)) { foreach ($m in (& $expandGroup "$g")) { [void]$inc.Remove($m) } }
+            foreach ($id in $inc) { if ($relevant.Contains($id)) { [void]$covered.Add($id) } }
+        }
+        $caUsers = $covered.Count
+    } catch {}
+    return [pscustomobject]@{ SecurityDefaults = $sd; CaMfaUsers = $caUsers }
+}
 function Get-CippMfaItem {
     # MFA posture via CIPP's ListMFAUsers report (Get-CIPPMFAState). Unlike the raw Graph
     # userRegistrationDetails report, this returns per-user accountEnabled / userType / CA-coverage /
@@ -1658,25 +1855,40 @@ function Get-CippMfaItem {
         # users / WatchGuard pill look. Empty when everyone's covered -> the pill degrades to a plain
         # non-expandable pill.
         $detail = @()
-        # Duo SSO section (only when the org has a matched Duo account). The pill TEXT is unchanged - this
-        # just explains the count: when M365 is federated to Duo, sign-in MFA is delegated to Duo (so the
-        # CA/SD/per-user view above legitimately reads 0 enforced), and we don't flag the pill. When it's
-        # NOT federated, the Duo M365 SSO app (if any) is inert, so we say so - red only if MFA is in fact
-        # unenforced (mirrors the pill's own alert), else neutral.
+        # Enforcement-mechanism breakdown: every mechanism that can require MFA, so the headline count
+        # explains itself. Active mechanisms read green. The pill TEXT is unchanged. Security Defaults / CA come from
+        # tenant-level Graph (omitted when unavailable); per-user MFA is counted from the report we already
+        # have; Duo SSO is the federation state (only when the org has a matched Duo account, with a Duo
+        # admin shortcut icon beside it). When M365 is federated to Duo, sign-in MFA is delegated to Duo -
+        # so a 0 on the CA/SD/per-user lines is expected and the pill is NOT flagged.
+        $relevantIds = @($relevant | ForEach-Object { "$($_.ID)" } | Where-Object { $_ })
+        $posture = Get-CippMfaPosture -TenantFilter $TenantFilter -RelevantIds $relevantIds
+        $perUser = @($relevant | Where-Object { "$($_.PerUser)" -in @('enforced','enabled') }).Count
         $federated = $false
+        if ($null -ne $posture.SecurityDefaults) {
+            $detail += New-DetailRow -K 'Security Defaults' -V $(if ($posture.SecurityDefaults) { 'On' } else { 'Off' }) -State $(if ($posture.SecurityDefaults) { 'ok' } else { '' })
+        }
+        if ($null -ne $posture.CaMfaUsers) {
+            $detail += New-DetailRow -K 'Conditional Access' -V "$($posture.CaMfaUsers)" -State $(if ($posture.CaMfaUsers -gt 0) { 'ok' } else { '' })
+        }
+        $detail += New-DetailRow -K 'Per-user MFA' -V "$perUser" -State $(if ($perUser -gt 0) { 'ok' } else { '' })
         if ($HasDuo) {
             $federated = Test-DuoFederationState -TenantFilter $TenantFilter
-            # A Duo admin-portal shortcut sits to the right of the status (the duo.com icon is the link).
-            $duoAct = if ($DuoAdminUrl) { @(New-Action -Dest 'duo' -Url $DuoAdminUrl) } else { @() }
-            $detail += New-DetailRow -K 'Duo'
-            if ($federated) {
-                $detail += New-DetailRow -V 'Federated' -State 'ok' -Actions $duoAct
-            } else {
-                $detail += New-DetailRow -V 'Not Federated' -State $(if ($enforced -lt $relevant.Count) { 'bad' } else { '' }) -Actions $duoAct
-            }
+            # Duo SSO state is purely the federation status (the ONE thing we can read authoritatively):
+            # 'Federated' (green) = Duo is the live M365 sign-in IdP; otherwise 'Not Configured' (neutral) =
+            # the domain is Managed so Duo SSO isn't the M365 sign-in path - whether or not an unused SSO app
+            # sits in Duo (which the Admin API can't show us [[duo-sso-m365-detection]]). Never red: Duo SSO
+            # not being in use isn't itself a fault, and any real MFA gap is already shown by the pill's red
+            # outline + 'Not enforced'. Duo admin-portal shortcut (the duo.com icon) sits to the right.
+            $duoAct  = if ($DuoAdminUrl) { @(New-Action -Dest 'duo' -Url $DuoAdminUrl) } else { @() }
+            $fedText  = if ($federated) { 'Federated' } else { 'Not Configured' }
+            $fedState = if ($federated) { 'ok' } else { '' }
+            $detail += New-DetailRow -K 'Duo SSO' -V $fedText -State $fedState -Actions $duoAct
         }
+        # 'Unprotected' = the relevant users with no MFA enforcement: red when any exist, green at 0 (always
+        # shown so a fully-covered tenant reads as a green 0). The at-risk UPNs list beneath when there are any.
+        $detail += New-DetailRow -K 'Unprotected' -V "$($notEnforced.Count)" -State $(if ($notEnforced.Count -gt 0) { 'bad' } else { 'ok' })
         if ($notEnforced.Count -gt 0) {
-            $detail += New-DetailRow -K 'Not enforced' -V "$($notEnforced.Count)"
             $detail += @($notEnforced |
                 ForEach-Object { (("$($_.UPN)".Trim()) -split '@')[0] } |
                 Where-Object { $_ } | Sort-Object |
@@ -1829,8 +2041,8 @@ function Get-DeliverabilityItems {
     # *.mail.onmicrosoft.com MOERA, which reports isInitial=false), any unverified / incomplete-setup
     # domain, and any domain whose supportedServices doesn't include Email (web-only/parked customs) so
     # the box stays mail-relevant. Each pill carries a DNS-host icon from its live NS records
-    # (Cloudflare-portal domains show the Cloudflare logo) and EXPANDS to its live SPF/DKIM/DMARC posture
-    # (Get-DomainDeliverability): a green ring when all three are healthy, a red outline when any is
+    # (Cloudflare-portal domains show the Cloudflare logo) and EXPANDS to its live MX + SPF/DKIM/DMARC posture
+    # (Get-DomainDeliverability): a green ring when all four are healthy, a red outline when any is
     # missing/broken. The panel's destination icon opens the domain's DNS where we manage it: a Cloudflare
     # icon -> that zone's DNS in the Cloudflare dashboard for portal domains, else an IT Glue icon -> the
     # domain's IT Glue record (or the org's DNS / Registrar asset list when no record matches).
@@ -1893,10 +2105,17 @@ function Get-DeliverabilityItems {
         # red outline (-Alert). The default domain is the first pill (sort order above), so its position
         # carries that signal; the ring/outline is reserved for deliverability health.
         $del = Get-DomainDeliverability -Domain $name
-        # SPF/DMARC are long TXT records -> list each token on its own (word-breaking) line so they don't
-        # spill the panel; SPF splits on whitespace, DMARC on ';'. DKIM is a short Published/Partial/Not
-        # published verdict. The box is already titled 'Deliverability', so no per-pill DetailHead.
+        # MX leads (where mail lands): a label caption + one member line per exchanger; missing collapses to
+        # a single red row. SPF/DMARC are long TXT records -> list each token on its own (word-breaking) line
+        # so they don't spill the panel; SPF splits on whitespace, DMARC on ';'. DKIM is a short
+        # Published/Partial/Not published verdict. The box is already titled 'Deliverability', so no DetailHead.
         $detail = @()
+        if ($del.Mx.Count -gt 0) {
+            $detail += New-DetailRow -K 'MX'
+            $detail += @($del.Mx | ForEach-Object { New-DetailRow -V $_ -Record })
+        } else {
+            $detail += New-DetailRow -K 'MX' -V 'Missing' -State 'bad'
+        }
         $detail += New-DnsRecordRows -Label 'SPF' -Value $del.Spf -State $del.SpfState -Present ($del.Spf -match '^(?i)v=spf1')
         $detail += New-DetailRow -K 'DKIM' -V $del.Dkim -State $del.DkimState
         $detail += New-DnsRecordRows -Label 'DMARC' -Value $del.Dmarc -State $del.DmarcState -Present ($del.Dmarc -match '^(?i)v=DMARC1') -Split ';'
@@ -1948,7 +2167,7 @@ function Get-CippMailboxItem {
 
 function Get-DashM365 {
     # 'Email' card: M365 license pills (live CIPP/GDAP, IT Glue fallback) plus a Deliverability band of
-    # the org's mail-enabled custom M365 domains and their SPF/DKIM/DMARC posture (Get-DeliverabilityItems).
+    # the org's mail-enabled custom M365 domains and their MX + SPF/DKIM/DMARC posture (Get-DeliverabilityItems).
     # The licenses go in an explicit 'Microsoft 365' band and the card is built -NoBand so the
     # Deliverability band keeps its own grouping. (MFA enforcement + AD-sync live on the Identity card.)
     param([pscustomobject]$Entry, [string]$OrgId, [string]$LinkBase, [pscustomobject]$CippTenant, [pscustomobject]$MswTenant)
@@ -2026,6 +2245,10 @@ function Get-DashM365 {
     if ($m365Items.Count -gt 0) {
         $items += New-CardGroup -Label 'Microsoft 365' -Brand 'microsoft.com' -Items $m365Items
     }
+    # Cove M365 cloud backup sits right after the Microsoft 365 band. Its 'Backup' group is built by
+    # Get-DashBackup (which holds the Cove session/devices) and stashed in $script:CoveM365EmailGroup;
+    # the backup card build runs before this one, so the stash is populated when present.
+    if ($script:CoveM365EmailGroup) { $items += $script:CoveM365EmailGroup }
     # SonicWall Cloud App Security (CAS): protected-user count from the client's MySonicWall CSC tile.
     if ($MswTenant) {
         $casCount = Get-MswServiceCount -Tenant $MswTenant -ServiceName 'CAS2.0'
@@ -2517,7 +2740,7 @@ function Get-DashDevices {
     # Fall back to the IT Glue active-config count when Automate has no match / no machine of that type.
     if (-not $wsPill) { $wsPill = Get-ConfigCountPill -Label 'Workstations' -TypeName 'Managed Workstation' -OrgId $OrgId -LinkBase $LinkBase -TypeId $WsTypeId -StatusId $StatusId -Link $autoLink -Brand $brand }
     if (-not $svPill) { $svPill = Get-ConfigCountPill -Label 'Servers'      -TypeName 'Managed Server'      -OrgId $OrgId -LinkBase $LinkBase -TypeId $SvTypeId -StatusId $StatusId -Link $autoLink -Brand $brand }
-    $items = @($wsPill, $svPill)
+    $items = @($svPill, $wsPill)   # servers before workstations
     # Microsoft 365 / Intune device counts (auto-banded under a 'Microsoft 365' strip via their brand).
     if ($CippTenant -and $CippTenant.Domain) {
         $items += @(Get-CippDeviceItems -TenantFilter $CippTenant.Domain)
@@ -3422,13 +3645,16 @@ function ConvertTo-CardItemHtml {
             # with a muted label and a bright (or cyan-linked) value; a K-only entry is a sub-caption.
             # When the panel has NO header (no DetailHead, no K rows at all) the list is the whole panel, so
             # it renders FLUSH (no indent/vertical line) - e.g. the Automate Servers pill's bare name list.
-            $flushMembers = (-not $Item.DetailHead) -and (@($Item.Detail | Where-Object { $_.K }).Count -eq 0)
+            $flushMembers = (-not $Item.DetailHead) -and (@($Item.Detail | Where-Object { $_.K -and -not $_.Indent }).Count -eq 0)
             $members = New-Object System.Collections.Generic.List[string]
             foreach ($r in @($Item.Detail)) {
-                $isMember = ($r.V -and -not $r.K)
-                if (-not $isMember -and $members.Count -gt 0) { $out.Add((Format-DetailMembers $members -Flush:$flushMembers)); $members.Clear() }
+                # A row is "boxed" (buffered into the indented, left-bordered list under the vertical line)
+                # when it's a bare V-only member OR explicitly flagged -Indent. An -Indent K/V row keeps the
+                # SAME key .... value styling as a top-level stat row - only its position changes.
+                $boxed = [bool]$r.Indent -or ($r.V -and -not $r.K)
+                if (-not $boxed -and $members.Count -gt 0) { $out.Add((Format-DetailMembers $members -Flush:$flushMembers)); $members.Clear() }
                 if ($r.K -and -not $r.V) {
-                    $out.Add("<div style=`"font-size:12.5px;font-weight:600;color:#8b96b0;padding:3px 0;`">$(Get-HtmlEncoded $r.K)</div>")
+                    $rowHtml = "<div style=`"font-size:12.5px;font-weight:600;color:#8b96b0;padding:3px 0;`">$(Get-HtmlEncoded $r.K)</div>"
                 } elseif ($r.K) {
                     # State colours the value: 'bad' red, 'ok' green (redesign palette). With -Actions the
                     # value stays PLAIN text and the destination icon-tiles sit to its right (the icons are the
@@ -3443,28 +3669,23 @@ function ConvertTo-CardItemHtml {
                     } else {
                         "<span style=`"flex:none;color:#eef1f8;font-weight:600;$vc`">$(Get-HtmlEncoded $r.V)</span>"
                     }
-                    $out.Add("<div style=`"display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:12.5px;padding:3px 0;`">" +
-                             "<span style=`"flex:1;min-width:0;color:#8b96b0;line-height:1.3;`">$(Get-HtmlEncoded $r.K)</span>$valHtml</div>")
+                    $rowHtml = "<div style=`"display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:12.5px;padding:3px 0;`">" +
+                               "<span style=`"flex:1;min-width:0;color:#8b96b0;line-height:1.3;`">$(Get-HtmlEncoded $r.K)</span>$valHtml</div>"
                 } else {
                     # V-only entry. With -Actions the name is PLAIN text with the destination icon-tiles to its
                     # right (a flex row: name left, icons right - e.g. a server + ScreenConnect + Automate). A
                     # legacy -Link still renders the name as a cyan member link; otherwise a plain bright line.
                     if (@($r.Actions).Count -gt 0) {
                         $acts = Format-DestIcons $r.Actions
-                        # State colours the name (e.g. the MFA pill's green 'Federated' / red 'Not Federated');
-                        # default keeps the bright list colour. The destination icon-tiles sit to its right.
-                        $mc = switch ($r.State) { 'bad' { 'color:#e0556a;' } 'ok' { 'color:#3fbf73;' } default { 'color:#eef1f8;' } }
-                        $members.Add("<div style=`"display:flex;justify-content:space-between;align-items:center;gap:10px;padding:2px 0;`">" +
-                                     "<span style=`"flex:1;min-width:0;font-size:12.5px;$mc line-height:1.3;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</span>$acts</div>")
+                        $rowHtml = "<div style=`"display:flex;justify-content:space-between;align-items:center;gap:10px;padding:2px 0;`">" +
+                                   "<span style=`"flex:1;min-width:0;font-size:12.5px;color:#eef1f8;line-height:1.3;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</span>$acts</div>"
                     } elseif ($r.Link) {
-                        $members.Add("<a href=`"$($r.Link)`" target=`"_blank`" rel=`"noopener`" style=`"display:block;font-size:12.5px;font-weight:600;color:#34c5f0;text-decoration:underline;text-underline-offset:2px;padding:1px 0;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</a>")
+                        $rowHtml = "<a href=`"$($r.Link)`" target=`"_blank`" rel=`"noopener`" style=`"display:block;font-size:12.5px;font-weight:600;color:#34c5f0;text-decoration:underline;text-underline-offset:2px;padding:1px 0;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</a>"
                     } else {
-                        # A plain member line. State colours it (e.g. the MFA pill's green 'Federated' /
-                        # red 'Not Federated' Duo-SSO status); default keeps the bright list colour.
-                        $mc = switch ($r.State) { 'bad' { 'color:#e0556a;' } 'ok' { 'color:#3fbf73;' } default { 'color:#eef1f8;' } }
-                        $members.Add("<div style=`"font-size:12.5px;$mc padding:1px 0;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</div>")
+                        $rowHtml = "<div style=`"font-size:12.5px;color:#eef1f8;padding:1px 0;word-break:break-word;`">$(Get-HtmlEncoded $r.V)</div>"
                     }
                 }
+                if ($boxed) { $members.Add($rowHtml) } else { $out.Add($rowHtml) }
             }
             if ($members.Count -gt 0) { $out.Add((Format-DetailMembers $members -Flush:$flushMembers)); $members.Clear() }
             $rows = ($out -join '')
