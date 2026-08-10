@@ -1,0 +1,16 @@
+{
+  "_comment": "Edit the gateways list below. Delete the examples and put your real VPN endpoints in. 'expectedCertSubject' is optional - set it to a string that should appear in your gateway's real certificate subject (e.g. your domain) and the script will flag TLS interception even by an unknown CA.",
+
+  "gateways": [
+    {
+      "host": "vpn.example.com",
+      "sslPort": 443,
+      "expectedCertSubject": "example.com"
+    },
+    {
+      "host": "vpn2.example.com",
+      "sslPort": 10443,
+      "expectedCertSubject": "example.com"
+    }
+  ]
+}
