@@ -79,9 +79,7 @@ $Hierarchies = @(
         RootSubjectMatch     = 'CN=Starfield TLS Root CA - R1'
         ExpectedCrossIssuer  = 'Starfield Root Certificate Authority - G2'
         CrossUrl             = 'https://certs.starfieldtech.com/repository/sf_tls_root-r1-cross-g2.crt'
-        KnownCrossThumbprint = $null   # URL verified 2026-08-19; thumbprint not yet pinned.
-                                       # Validated structurally at runtime. To pin it, run
-                                       # certutil -dump on the downloaded file and paste the SHA1 here.
+        KnownCrossThumbprint = '0D257EB08FCBD99AD93E9124313D05FA439BF499'   # verified 2026-08-19
     }
 )
 
