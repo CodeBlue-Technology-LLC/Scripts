@@ -15,7 +15,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Path  = '\\192.168.16.14\elc\Shared',
+    [string]$Path  = '',
     [int]   $Limit = 259   # MAX_PATH is 260 including the terminating null
 )
 
